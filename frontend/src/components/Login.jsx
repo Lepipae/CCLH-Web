@@ -3,7 +3,10 @@ import { motion } from 'framer-motion'
 
 export default function Login({ onJoin }) {
   const [name, setName] = useState('')
-  const [room, setRoom] = useState('')
+  const [room, setRoom] = useState(() => {
+    const params = new URLSearchParams(window.location.search)
+    return params.get('room') || ''
+  })
 
   const handleSubmit = (e) => {
     e.preventDefault()
@@ -20,7 +23,7 @@ export default function Login({ onJoin }) {
         animate={{ y: 0, opacity: 1 }}
         transition={{ duration: 0.6 }}
       >
-        <h1>Juego de Cartas</h1>
+        <h1 style={{ fontSize: '2rem' }}>Cartas Contra Miedo Y Hambre</h1>
         <p className="subtitle">Únete a una sala para empezar a jugar</p>
         
         <form onSubmit={handleSubmit} id="login-form">

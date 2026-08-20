@@ -68,8 +68,9 @@ export default function GameScreen({ gameState, mySid, socket }) {
             className="btn-secondary" 
             style={{ padding: '0.4rem 0.8rem', display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 0 }} 
             onClick={() => {
-              navigator.clipboard.writeText(window.location.href)
-              alert('Enlace de invitación copiado al portapapeles!')
+              const inviteUrl = `${window.location.origin}${window.location.pathname}?room=${room_id}`
+              navigator.clipboard.writeText(inviteUrl)
+              alert(`¡Enlace de invitación copiado al portapapeles!\n\n${inviteUrl}`)
             }}
           >
             <Copy size={16} /> Invitar
@@ -91,8 +92,13 @@ export default function GameScreen({ gameState, mySid, socket }) {
               {isLeader && (
                 <>
                   <LobbyOptions socket={socket} roomId={room_id} options={options} />
-                  <button className="btn-primary" onClick={handleStart} style={{ marginTop: '1rem' }}>
-                    Iniciar Partida
+                  <button 
+                    className="btn-primary" 
+                    onClick={handleStart} 
+                    disabled={players.length < 2}
+                    style={{ marginTop: '1rem', opacity: players.length < 2 ? 0.5 : 1, cursor: players.length < 2 ? 'not-allowed' : 'pointer' }}
+                  >
+                    {players.length < 2 ? 'Faltan jugadores' : 'Iniciar Partida'}
                   </button>
                 </>
               )}
