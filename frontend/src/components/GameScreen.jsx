@@ -87,8 +87,20 @@ export default function GameScreen({ gameState, mySid, socket }) {
         <main className="board">
           {state === 'waiting' ? (
             <div className="glass-panel" style={{ margin: 'auto' }}>
-              <h2>Esperando jugadores...</h2>
-              <p>Mínimo 2 jugadores para empezar.</p>
+              <h2>
+                {players.length < 2 
+                  ? 'Esperando jugadores...' 
+                  : isLeader 
+                    ? '¡Todo listo para empezar!' 
+                    : 'Esperando al líder...'}
+              </h2>
+              <p>
+                {players.length < 2 
+                  ? 'Mínimo 2 jugadores para empezar.' 
+                  : isLeader 
+                    ? 'Configura las opciones y dale a iniciar.' 
+                    : 'El líder está configurando la sala y pronto iniciará la partida.'}
+              </p>
               {isLeader && (
                 <>
                   <LobbyOptions socket={socket} roomId={room_id} options={options} />
@@ -106,10 +118,29 @@ export default function GameScreen({ gameState, mySid, socket }) {
           ) : (
             <>
               <div id="status-bar">
-                {isCzar ? "Eres el Juez 👑. Espera a que los demás jueguen." :
-                 me?.waiting_next_round ? "Partida en curso. Entrarás a jugar en la siguiente ronda." :
-                 me?.has_played ? "Has jugado tus cartas. Esperando a los demás..." :
-                 "Es tu turno. Elige cartas para jugar."}
+                {state === 'judging' ? (
+                  isCzar ? (
+                    played_cards.every(c => c.revealed) 
+                      ? "¡Todas las respuestas reveladas! Haz clic en la que más te guste para elegir al ganador 🏆." 
+                      : "¡Todos han jugado! Haz clic en cada carta boca abajo para revelarla 👑."
+                  ) : (
+                    "El Juez 👑 está revelando y evaluando las respuestas... ⚖️"
+                  )
+                ) : state === 'round_end' ? (
+                  isCzar ? (
+                    "¡Ganador seleccionado! Pulsa 'Siguiente Ronda' cuando queráis continuar."
+                  ) : (
+                    "Ronda finalizada. Esperando a que el Juez inicie la siguiente ronda."
+                  )
+                ) : isCzar ? (
+                  "Eres el Juez 👑. Espera a que los demás jugadores elijan su respuesta."
+                ) : me?.waiting_next_round ? (
+                  "Partida en curso. Entrarás a jugar en la siguiente ronda."
+                ) : me?.has_played ? (
+                  "Has jugado tu carta ✅. Esperando a que los demás jugadores terminen..."
+                ) : (
+                  "Es tu turno. Elige tu carta para jugar."
+                )}
               </div>
 
               <div className="center-area">
@@ -192,10 +223,10 @@ export default function GameScreen({ gameState, mySid, socket }) {
             <div className="player-hand-container">
               <h3>Tu Mano</h3>
               <div className="player-hand">
-                <AnimatePresence>
+                <AnimatePresence mode="popLayout">
                   {hand.map((txt, idx) => (
                     <Card 
-                      key={txt + idx} // simple unique key for now
+                      key={txt} // Usar solo el texto para que la key sea estable al desplazar índices
                       text={txt} 
                       type="white" 
                       isPlayable={canPlay}

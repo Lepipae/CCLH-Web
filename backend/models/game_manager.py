@@ -78,6 +78,11 @@ class GameManager:
                 if active:
                     if room.leader == sid:
                         room.leader = active[0].sid
+                    if room.state == 'playing':
+                        active_non_czars = [pl for pl in active if pl.sid != room.czar and not pl.waiting_next_round]
+                        if active_non_czars and all(pl.played_card is not None for pl in active_non_czars):
+                            room.state = 'judging'
+                            random.shuffle(room.played_cards)
                     self.send_room_update(room_id)
 
     def start_game(self, sid, room_id):
@@ -90,6 +95,8 @@ class GameManager:
                     
                     hand_size = room.options['hand_size']
                     for p in active:
+                        p.played_card = None
+                        p.waiting_next_round = False
                         faltan = hand_size - len(p.hand)
                         if faltan > 0:
                             p.hand.extend(room.deal_cards(faltan))

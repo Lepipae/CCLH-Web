@@ -343,13 +343,7 @@ button {
     flex-direction: column;
     box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5);
     position: relative;
-    transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.3s ease;
-    animation: popIn 0.5s ease-out forwards;
-}
-
-@keyframes popIn {
-    0% { transform: scale(0.8); opacity: 0; }
-    100% { transform: scale(1); opacity: 1; }
+    box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5);
 }
 
 .card.black {
@@ -395,7 +389,6 @@ button {
 }
 
 .card.playable:hover {
-    transform: translateY(-10px) scale(1.05);
     box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.7);
     cursor: pointer;
     border: 2px solid var(--accent-primary);

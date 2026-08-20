@@ -68,6 +68,10 @@ class Room:
                     })
                 else:
                     played_cards_public.append({'id': c['id'], 'cards': [], 'revealed': False, 'sid': None})
+        elif self.state == 'playing':
+            # Mostrar las cartas boca abajo mientras la gente está jugando
+            for c in self.played_cards:
+                played_cards_public.append({'id': c['id'], 'cards': [], 'revealed': False, 'sid': None})
                     
         payload = {
             'room_id': self.room_id,
