@@ -23,8 +23,8 @@ export default function LobbyOptions({ socket, roomId, options }) {
   }
 
   return (
-    <div className="glass-panel" style={{ marginTop: '2rem', padding: '1.5rem', textAlign: 'left' }}>
-      <h3 style={{ marginBottom: '1rem' }}>⚙️ Opciones de la Sala</h3>
+    <div style={{ marginTop: '2rem', padding: '1.5rem', textAlign: 'left', background: 'rgba(0,0,0,0.2)', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)' }}>
+      <h3 style={{ marginBottom: '1rem', fontSize: '0.9rem', color: 'var(--text-secondary)' }}>⚙️ Opciones de la Sala</h3>
       
       <div className="form-group">
         <label>Cartas en la mano</label>

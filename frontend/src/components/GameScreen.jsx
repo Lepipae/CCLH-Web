@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { Copy } from 'lucide-react'
 import Leaderboard from './Leaderboard'
 import Chat from './Chat'
 import Card from './Card'
@@ -60,9 +61,19 @@ export default function GameScreen({ gameState, mySid, socket }) {
         <div className="header-left">
           <h2>Sala: {room_id}</h2>
         </div>
-        <div className="header-right">
+        <div className="header-right" style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
           <span id="player-name">{me?.name || 'Espectador'}</span>
           {isCzar && <span className="badge">👑 Juez Actual</span>}
+          <button 
+            className="btn-secondary" 
+            style={{ padding: '0.4rem 0.8rem', display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 0 }} 
+            onClick={() => {
+              navigator.clipboard.writeText(window.location.href)
+              alert('Enlace de invitación copiado al portapapeles!')
+            }}
+          >
+            <Copy size={16} /> Invitar
+          </button>
         </div>
       </header>
 
@@ -115,7 +126,12 @@ export default function GameScreen({ gameState, mySid, socket }) {
                             if (!pc.revealed) {
                               socket.emit('reveal_card', { room_id, sub_id: pc.id })
                             } else {
-                              socket.emit('choose_winner', { room_id, sub_id: pc.id })
+                              const allRevealed = played_cards.every(c => c.revealed);
+                              if (allRevealed) {
+                                socket.emit('choose_winner', { room_id, sub_id: pc.id })
+                              } else {
+                                alert('¡Debes revelar todas las cartas antes de elegir un ganador!');
+                              }
                             }
                           }
                         }}
@@ -152,9 +168,14 @@ export default function GameScreen({ gameState, mySid, socket }) {
                 >
                   {has_voted_renew ? `Votado (${renew_votes}/${neededVotes})` : `Renovar Cartas (${renew_votes}/${neededVotes})`}
                 </button>
-                {isCzar && (
+                {isCzar && state === 'playing' && (
                   <button className="btn-secondary" onClick={handleChangeBlack}>
                     Cambiar Carta Negra
+                  </button>
+                )}
+                {isCzar && state === 'round_end' && (
+                  <button className="btn-primary" onClick={() => socket.emit('next_round', { room_id })}>
+                    Siguiente Ronda
                   </button>
                 )}
               </div>

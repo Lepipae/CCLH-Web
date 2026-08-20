@@ -144,12 +144,16 @@ class GameManager:
                     return
                 
                 indices = card_index if isinstance(card_index, list) else [card_index]
-                indices = [i for i in indices if 0 <= i < len(p.hand)]
-                if indices:
-                    indices.sort(reverse=True)
-                    played_texts = []
-                    for i in indices:
-                        played_texts.insert(0, p.hand.pop(i))
+                valid_indices = [i for i in indices if 0 <= i < len(p.hand)]
+                if valid_indices:
+                    # Preservar el orden original en el que el jugador seleccionó las cartas
+                    played_texts = [p.hand[i] for i in valid_indices]
+                    
+                    # Eliminar las cartas de la mano (de mayor a menor índice para no alterar los demás)
+                    valid_indices.sort(reverse=True)
+                    for i in valid_indices:
+                        p.hand.pop(i)
+                        
                     p.played_card = played_texts
                     
                     sub_id = str(uuid.uuid4())[:8]

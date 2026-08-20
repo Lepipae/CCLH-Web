@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { Send } from 'lucide-react'
 
 export default function Chat({ socket, room_id }) {
   const [messages, setMessages] = useState([])
@@ -54,7 +55,9 @@ export default function Chat({ socket, room_id }) {
           placeholder="Escribe algo..." 
           maxLength="100" 
         />
-        <button type="submit">En</button>
+        <button type="submit" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Send size={18} />
+        </button>
       </form>
     </div>
   )
