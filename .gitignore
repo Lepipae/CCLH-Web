@@ -1,4 +1,5 @@
 ngrok
 ngrok.log
 start_ngrok.sh
-stop_game.sh
+stop_game.shstart.sh
+start.sh

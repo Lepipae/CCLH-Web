@@ -3,7 +3,7 @@ import { io } from 'socket.io-client'
 import Login from './components/Login'
 import GameScreen from './components/GameScreen'
 
-const socket = io('http://localhost:3000')
+const socket = io()
 
 function App() {
   const [inGame, setInGame] = useState(false)

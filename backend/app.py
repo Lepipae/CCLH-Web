@@ -1,10 +1,11 @@
 import json
 import os
-from flask import Flask, request
+from flask import Flask, request, send_from_directory
 from flask_socketio import SocketIO, join_room, emit
 from models.game_manager import GameManager
 
-app = Flask(__name__)
+# Configurar Flask para servir archivos estáticos del frontend de React
+app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
 app.config['SECRET_KEY'] = 'secreto_super_seguro'
 # Permitimos CORS a Vite
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -32,6 +33,14 @@ def cargar_cartas():
 cargar_cartas()
 
 manager = GameManager(socketio, CARTAS_BLANCAS, CARTAS_NEGRAS)
+
+@app.route('/')
+def index():
+    return app.send_static_file('index.html')
+
+@app.route('/<path:path>')
+def serve_static(path):
+    return app.send_static_file(path)
 
 @socketio.on('join_game')
 def on_join(data):
