@@ -13,13 +13,13 @@ export default function Leaderboard({ players, gameState }) {
           {sortedPlayers.map((p) => {
             let status = ''
             if (p.is_czar) {
-              status = ' 👑 (Juez)'
+              status = ' 🔨'
             } else if (p.waiting_next_round) {
-              status = ' 🕒 (Espectador)'
+              status = ' 🕒'
             } else if (p.has_played) {
-              status = ' ✅ (Jugó)'
+              status = ' ✅'
             } else if (gameState === 'playing') {
-              status = ' ⏳ (Pensando...)'
+              status = ' ⏳'
             }
 
             return (
@@ -31,9 +31,9 @@ export default function Leaderboard({ players, gameState }) {
                 exit={{ opacity: 0, x: -20 }}
                 className="player-item"
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span>{p.name} {status}</span>
-                  <span className="badge">{p.points} pts</span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>{p.name}{status}</span>
+                  <span className="badge">{p.points}</span>
                 </div>
               </motion.li>
             )

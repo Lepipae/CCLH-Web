@@ -186,6 +186,7 @@ button {
     border-radius: 999px;
     font-size: 0.875rem;
     color: #93c5fd;
+    white-space: nowrap;
 }
 
 /* Game Layout */

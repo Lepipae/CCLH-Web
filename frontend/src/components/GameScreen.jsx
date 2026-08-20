@@ -63,7 +63,7 @@ export default function GameScreen({ gameState, mySid, socket }) {
         </div>
         <div className="header-right" style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
           <span id="player-name">{me?.name || 'Espectador'}</span>
-          {isCzar && <span className="badge">👑 Juez Actual</span>}
+          {isCzar && <span className="badge">🔨 Juez</span>}
           <button 
             className="btn-secondary" 
             style={{ padding: '0.4rem 0.8rem', display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 0 }} 
@@ -122,9 +122,9 @@ export default function GameScreen({ gameState, mySid, socket }) {
                   isCzar ? (
                     played_cards.every(c => c.revealed) 
                       ? "¡Todas las respuestas reveladas! Haz clic en la que más te guste para elegir al ganador 🏆." 
-                      : "¡Todos han jugado! Haz clic en cada carta boca abajo para revelarla 👑."
+                      : "¡Todos han jugado! Haz clic en cada carta boca abajo para revelarla 🔨."
                   ) : (
-                    "El Juez 👑 está revelando y evaluando las respuestas... ⚖️"
+                    "El Juez 🔨 está revelando y evaluando las respuestas... ⚖️"
                   )
                 ) : state === 'round_end' ? (
                   isCzar ? (
@@ -133,7 +133,7 @@ export default function GameScreen({ gameState, mySid, socket }) {
                     "Ronda finalizada. Esperando a que el Juez inicie la siguiente ronda."
                   )
                 ) : isCzar ? (
-                  "Eres el Juez 👑. Espera a que los demás jugadores elijan su respuesta."
+                  "Eres el Juez 🔨. Espera a que los demás jugadores elijan su respuesta."
                 ) : me?.waiting_next_round ? (
                   "Partida en curso. Entrarás a jugar en la siguiente ronda."
                 ) : me?.has_played ? (
