@@ -66,7 +66,29 @@
             <main class="board">
                 <div id="status-bar">Esperando a que empiece la partida...</div>
                 
-                <div id="room-custom-cards" class="hidden" style="margin-top: 2rem; max-width: 600px; width: 100%; align-self: center; background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 16px; border: 1px solid var(--glass-border);">
+                <div id="lobby-options" class="hidden" style="margin-top: 2rem; max-width: 600px; width: 100%; align-self: center; background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 16px; border: 1px solid var(--glass-border);">
+                    <h3 style="margin-top: 0; margin-bottom: 1rem; color: var(--text-primary); text-align: left;">Opciones de la Partida</h3>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; text-align: left;">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label for="opt-hand-size" style="color: var(--text-secondary); font-size: 0.9rem;">Cartas en Mano</label>
+                            <input type="number" id="opt-hand-size" min="5" max="20" value="10" style="padding: 0.5rem; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: white; width: 100%; margin-bottom: 0;">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label for="opt-renew-threshold" style="color: var(--text-secondary); font-size: 0.9rem;">Votos para Renovar (%)</label>
+                            <input type="number" id="opt-renew-threshold" min="10" max="100" step="5" value="75" style="padding: 0.5rem; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: white; width: 100%; margin-bottom: 0;">
+                        </div>
+                        <div class="form-group" style="margin-bottom: 0; grid-column: span 2;">
+                            <label for="opt-turn-order" style="color: var(--text-secondary); font-size: 0.9rem;">Orden de Turnos (Juez)</label>
+                            <select id="opt-turn-order" style="padding: 0.5rem; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: white; width: 100%; margin-bottom: 0; cursor: pointer;">
+                                <option value="winner">Ganador de la ronda anterior</option>
+                                <option value="random">Aleatorio</option>
+                                <option value="sequential">Secuencial (por orden de llegada)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="room-custom-cards" class="hidden" style="margin-top: 1rem; max-width: 600px; width: 100%; align-self: center; background: rgba(0,0,0,0.2); padding: 1.5rem; border-radius: 16px; border: 1px solid var(--glass-border);">
                     <label for="custom-cards-input" style="color: var(--text-primary); text-align: left; display: block; margin-bottom: 0.5rem; font-weight: 600;">Añadir Cartas Blancas Locales (separadas por coma)</label>
                     <div style="display: flex; gap: 0.5rem; width: 100%;">
                         <input type="text" id="custom-cards-input" class="form-group" placeholder="Ej: Mi suegra, Un gato ninja, Patatas bravas" autocomplete="off" style="flex: 1; margin-bottom: 0; padding: 0.75rem; background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; color: white;">

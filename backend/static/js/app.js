@@ -18,6 +18,10 @@ const roomIdInput = document.getElementById('room_id');
 const roomCustomCards = document.getElementById('room-custom-cards');
 const customCardsInput = document.getElementById('custom-cards-input');
 const addCustomCardsBtn = document.getElementById('add-custom-cards-btn');
+const lobbyOptions = document.getElementById('lobby-options');
+const optHandSize = document.getElementById('opt-hand-size');
+const optRenewThreshold = document.getElementById('opt-renew-threshold');
+const optTurnOrder = document.getElementById('opt-turn-order');
 const chatMessages = document.getElementById('chat-messages');
 const chatInput = document.getElementById('chat-input');
 const chatSendBtn = document.getElementById('chat-send-btn');
@@ -61,7 +65,15 @@ joinBtn.addEventListener('click', () => {
     }
 });
 
+socket.on('join_error', (data) => {
+    alert(data.message);
+    current_room = null;
+    gameScreen.classList.remove('active');
+    loginScreen.classList.add('active');
+});
+
 startBtn.addEventListener('click', () => {
+    sendOptionsUpdate();
     socket.emit('start_game', { room_id: current_room });
 });
 
@@ -91,6 +103,21 @@ addCustomCardsBtn.addEventListener('click', () => {
         customCardsInput.value = '';
     }
 });
+
+function sendOptionsUpdate() {
+    if (!current_room) return;
+    const data = {
+        room_id: current_room,
+        hand_size: parseInt(optHandSize.value) || 10,
+        renew_threshold: (parseInt(optRenewThreshold.value) || 75) / 100.0,
+        turn_order: optTurnOrder.value
+    };
+    socket.emit('update_room_options', data);
+}
+
+optHandSize.addEventListener('change', sendOptionsUpdate);
+optRenewThreshold.addEventListener('change', sendOptionsUpdate);
+optTurnOrder.addEventListener('change', sendOptionsUpdate);
 
 function sendChatMessage() {
     const msg = chatInput.value.trim();
@@ -139,6 +166,8 @@ socket.on('game_update', (data) => {
         let status = '';
         if (p.is_czar) {
             status = ' 👑 (Juez)';
+        } else if (p.waiting_next_round) {
+            status = ' 🕒 (Espectador)';
         } else if (p.has_played) {
             status = ' ✅ (Jugó)';
         } else if (data.state === 'playing') {
@@ -158,7 +187,8 @@ socket.on('game_update', (data) => {
     
     if (data.state !== 'waiting') {
         renewBtn.classList.remove('hidden');
-        const threshold = Math.ceil(data.total_active * 0.75);
+        const current_threshold = data.options ? data.options.renew_threshold : 0.75;
+        const threshold = Math.ceil(data.total_active * current_threshold);
         renewBtn.textContent = `Renovar Cartas (${data.renew_votes}/${threshold})`;
         if (data.has_voted_renew) {
             renewBtn.disabled = true;
@@ -175,6 +205,19 @@ socket.on('game_update', (data) => {
     
     if (data.state === 'waiting') {
         roomCustomCards.classList.remove('hidden');
+        lobbyOptions.classList.remove('hidden');
+        
+        if (data.options) {
+            if (document.activeElement !== optHandSize) optHandSize.value = data.options.hand_size;
+            if (document.activeElement !== optRenewThreshold) optRenewThreshold.value = Math.round(data.options.renew_threshold * 100);
+            if (document.activeElement !== optTurnOrder) optTurnOrder.value = data.options.turn_order;
+        }
+        
+        const isLeader = data.leader === mi_sid;
+        optHandSize.disabled = !isLeader;
+        optRenewThreshold.disabled = !isLeader;
+        optTurnOrder.disabled = !isLeader;
+        
         if (data.players.length < 2) {
             statusBar.textContent = "Esperando a que se unan más jugadores...";
         } else {
@@ -194,6 +237,7 @@ socket.on('game_update', (data) => {
     }
     else if (data.state === 'playing') {
         roomCustomCards.classList.add('hidden');
+        lobbyOptions.classList.add('hidden');
         blackCardSlot.classList.remove('hidden');
         if (typeof data.black_card === 'string') {
             blackCardText.innerHTML = data.black_card.replace(/_/g, '______');
@@ -230,7 +274,9 @@ socket.on('game_update', (data) => {
         } else {
             changeBlackBtn.classList.add('hidden');
             const me = data.players.find(p => p.id === mi_sid);
-            if (me && me.has_played) {
+            if (me && me.waiting_next_round) {
+                statusBar.textContent = "Partida en curso. Entrarás a jugar en la siguiente ronda.";
+            } else if (me && me.has_played) {
                 statusBar.textContent = "Has jugado tus cartas. Esperando a los demás...";
             } else {
                 statusBar.textContent = "Es tu turno. Elige cartas para jugar.";
@@ -291,7 +337,7 @@ socket.on('game_update', (data) => {
 function renderHand(hand, state, is_czar, players) {
     playerHandArea.innerHTML = '';
     const me = players.find(p => p.id === mi_sid);
-    const can_play = state === 'playing' && !is_czar && me && !me.has_played;
+    const can_play = state === 'playing' && !is_czar && me && !me.has_played && !me.waiting_next_round;
     
     hand.forEach((cardText, index) => {
         const card = document.createElement('div');
