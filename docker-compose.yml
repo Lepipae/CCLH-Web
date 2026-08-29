@@ -1,0 +1,25 @@
+name: cartas-contra-la-humanidad
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cclh_app
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: cclh_ngrok
+    restart: unless-stopped
+    command:
+      - "http"
+      - "app:3000"
+    ports:
+      - "4040:4040"
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    depends_on:
+      - app
