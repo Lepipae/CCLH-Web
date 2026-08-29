@@ -83,6 +83,7 @@ class GameManager:
                         if active_non_czars and all(pl.played_card is not None for pl in active_non_czars):
                             room.state = 'judging'
                             random.shuffle(room.played_cards)
+                    self.check_and_execute_renew(room)
                     self.send_room_update(room_id)
 
     def start_game(self, sid, room_id):
@@ -92,6 +93,7 @@ class GameManager:
                 active = room.get_active_players()
                 if len(active) >= 2:
                     room.state = 'playing'
+                    room.renew_votes.clear()
                     
                     hand_size = room.options['hand_size']
                     for p in active:
@@ -239,6 +241,7 @@ class GameManager:
                 
             room.state = 'playing'
             room.played_cards = []
+            room.renew_votes.clear()
             
             if not room.available_blacks:
                 room.available_blacks = list(self.global_black_cards)
@@ -261,28 +264,41 @@ class GameManager:
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if sid in room.players and room.players[sid].is_connected:
-                room.renew_votes.add(sid)
+                if sid in room.renew_votes:
+                    room.renew_votes.remove(sid)
+                else:
+                    room.renew_votes.add(sid)
                 
-                active = room.get_active_players()
-                if active:
-                    thresh = room.options['renew_threshold']
-                    if (len(room.renew_votes) / len(active)) >= thresh:
-                        room.renew_votes.clear()
-                        for p in active:
-                            room.available_whites.extend(p.hand)
-                            p.hand = []
-                            
-                        random.shuffle(room.available_whites)
-                        hand_size = room.options['hand_size']
-                        for p in active:
-                            p.hand = room.deal_cards(hand_size)
-                            p.played_card = None
-                            
-                        room.played_cards = []
-                        if room.state == 'judging':
-                            room.state = 'playing'
-                            
+                self.check_and_execute_renew(room)
                 self.send_room_update(room_id)
+
+    def check_and_execute_renew(self, room):
+        active = room.get_active_players()
+        eligible = [p for p in active if p.sid != room.czar and not p.waiting_next_round]
+        voters = eligible if eligible else active
+        if voters:
+            thresh = room.options['renew_threshold']
+            if (len(room.renew_votes) / len(voters)) >= thresh:
+                room.renew_votes.clear()
+                for p in active:
+                    room.available_whites.extend(p.hand)
+                    if p.played_card:
+                        if isinstance(p.played_card, list):
+                            room.available_whites.extend(p.played_card)
+                        else:
+                            room.available_whites.append(p.played_card)
+                    p.hand = []
+                    p.played_card = None
+                    
+                random.shuffle(room.available_whites)
+                hand_size = room.options['hand_size']
+                for p in active:
+                    p.hand = room.deal_cards(hand_size)
+                    
+                room.played_cards = []
+                if room.state == 'judging':
+                    room.state = 'playing'
+                self.send_chat_system(room.room_id, '¡Se han renovado las cartas de todos los jugadores!')
 
     def change_black_card(self, sid, room_id):
         if room_id in self.rooms:

@@ -197,14 +197,21 @@ export default function GameScreen({ gameState, mySid, socket }) {
               </div>
 
               <div id="game-controls" style={{ display: 'flex', gap: '1rem', justifyContent: 'center', marginBottom: '2rem' }}>
-                <button 
-                  className="btn-secondary" 
-                  onClick={handleRenew} 
-                  disabled={has_voted_renew}
-                  style={{ opacity: has_voted_renew ? 0.5 : 1 }}
-                >
-                  {has_voted_renew ? `Votado (${renew_votes}/${neededVotes})` : `Renovar Cartas (${renew_votes}/${neededVotes})`}
-                </button>
+                {!isCzar && (
+                  <button 
+                    className="btn-secondary" 
+                    onClick={handleRenew} 
+                    style={{ 
+                      background: has_voted_renew ? 'rgba(59, 130, 246, 0.3)' : undefined,
+                      borderColor: has_voted_renew ? 'var(--accent-primary)' : undefined
+                    }}
+                    title={has_voted_renew ? 'Haz clic para cancelar tu voto' : 'Vota para cambiar las cartas de tu mano'}
+                  >
+                    {has_voted_renew 
+                      ? `✓ Votado para renovar (${renew_votes}/${neededVotes})` 
+                      : `Renovar Cartas (${renew_votes}/${neededVotes})`}
+                  </button>
+                )}
                 {isCzar && state === 'playing' && (
                   <button className="btn-secondary" onClick={handleChangeBlack}>
                     Cambiar Carta Negra

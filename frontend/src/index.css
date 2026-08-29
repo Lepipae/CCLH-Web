@@ -328,10 +328,12 @@ button {
 .center-area {
     flex: 1;
     display: flex;
-    gap: 2rem;
+    gap: 1.5rem;
     justify-content: center;
     align-items: flex-start;
     margin-bottom: 2rem;
+    width: 100%;
+    min-width: 0;
 }
 
 /* Cards */
@@ -344,13 +346,13 @@ button {
     flex-direction: column;
     box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5);
     position: relative;
-    box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5);
 }
 
 .card.black {
     background: var(--card-black);
     color: white;
     border: 1px solid rgba(255, 255, 255, 0.1);
+    flex: 0 0 auto;
 }
 
 .card.white {
@@ -384,9 +386,13 @@ button {
 
 .played-cards {
     display: flex;
-    flex-wrap: wrap;
-    gap: 1rem;
-    max-width: 600px;
+    flex: 1;
+    flex-wrap: nowrap;
+    gap: 0.75rem;
+    justify-content: center;
+    align-items: flex-start;
+    width: 100%;
+    min-width: 0;
 }
 
 .card.playable:hover {
@@ -506,19 +512,42 @@ button {
     display: flex;
     flex-direction: column;
     align-items: center;
-    margin: 0 0.5rem;
     position: relative;
     cursor: pointer;
-    transition: transform 0.2s ease;
+    transition: transform 0.2s ease, max-width 0.3s ease;
+    flex: 1 1 0;
+    min-width: 0;
+    max-width: 220px;
+    width: 100%;
 }
 
 .card-stack:hover {
-    transform: translateY(-10px);
+    transform: translateY(-10px) scale(1.04);
+    z-index: 50;
+}
+
+.played-cards .card {
+    width: 100%;
+    aspect-ratio: 11 / 15;
+    height: auto;
+    max-height: 300px;
+    padding: clamp(0.6rem, 1.2vw, 1.5rem);
+    box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.5);
+}
+
+.played-cards .card .card-text {
+    font-size: clamp(0.65rem, 1.1vw, 1.25rem);
+    line-height: 1.35;
+}
+
+.played-cards .card .card-footer {
+    font-size: clamp(0.55rem, 0.8vw, 0.75rem);
+    padding-top: 0.25rem;
 }
 
 .card-stack .card {
     margin: 0;
-    margin-top: -60px; /* Offset to stack them */
+    margin-top: -25%; /* Responsive negative offset to stack multi-pick cards */
     box-shadow: 0 -4px 10px rgba(0,0,0,0.4);
 }
 .card-stack .card:first-child {

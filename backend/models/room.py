@@ -73,6 +73,10 @@ class Room:
             for c in self.played_cards:
                 played_cards_public.append({'id': c['id'], 'cards': [], 'revealed': False, 'sid': None})
                     
+        active_players = self.get_active_players()
+        voters = [p for p in active_players if p.sid != self.czar and not p.waiting_next_round]
+        voters_count = len(voters) if voters else len(active_players)
+
         payload = {
             'room_id': self.room_id,
             'state': self.state,
@@ -84,7 +88,7 @@ class Room:
             'winner_sid': self.last_winner,
             'renew_votes': len(self.renew_votes),
             'has_voted_renew': for_sid in self.renew_votes,
-            'total_active': len(self.get_active_players()),
+            'total_active': voters_count,
             'options': self.options
         }
         
