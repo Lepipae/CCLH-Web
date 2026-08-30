@@ -18,10 +18,7 @@ export default function Chat({ socket, room_id }) {
 
   useEffect(() => {
     if (chatMessagesRef.current) {
-      chatMessagesRef.current.scrollTo({
-        top: chatMessagesRef.current.scrollHeight,
-        behavior: 'smooth'
-      })
+      chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight
     }
   }, [messages])
 
@@ -37,19 +34,15 @@ export default function Chat({ socket, room_id }) {
     <div className="sidebar-bottom">
       <h3>Chat</h3>
       <div className="chat-messages" ref={chatMessagesRef}>
-        <AnimatePresence>
-          {messages.map((m, i) => (
-            <motion.div 
-              key={i}
-              initial={{ opacity: 0, x: -10 }}
-              animate={{ opacity: 1, x: 0 }}
-              className={`chat-message ${m.system ? 'system' : ''}`}
-            >
-              {!m.system && <strong>{m.sender}: </strong>}
-              {m.msg}
-            </motion.div>
-          ))}
-        </AnimatePresence>
+        {messages.map((m, i) => (
+          <div 
+            key={i}
+            className={`chat-message ${m.system ? 'system' : ''}`}
+          >
+            {!m.system && <strong>{m.sender}: </strong>}
+            {m.msg}
+          </div>
+        ))}
       </div>
       <form className="chat-input-area" onSubmit={sendChat}>
         <input 

@@ -21,12 +21,16 @@ html, body, #root {
     font-family: 'Inter', sans-serif;
     background: linear-gradient(135deg, var(--bg-darker) 0%, var(--bg-dark) 100%);
     color: var(--text-primary);
-    height: 100vh;
-    max-height: 100vh;
-    width: 100vw;
+    height: 100%;
+    width: 100%;
     margin: 0;
     padding: 0;
     overflow: hidden;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
 }
 
 h1, h2, h3 {
@@ -36,18 +40,27 @@ h1, h2, h3 {
 /* Screens */
 .screen {
     display: none;
-    height: 100vh;
-    max-height: 100vh;
-    width: 100vw;
+    height: 100%;
+    width: 100%;
     overflow: hidden;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
 }
 
 .screen.active {
     display: flex;
     flex-direction: column;
-    height: 100vh;
-    max-height: 100vh;
+    height: 100%;
+    width: 100%;
     overflow: hidden;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
 }
 
 /* Login Screen */
@@ -203,7 +216,8 @@ button {
     display: flex;
     flex: 1 1 0%;
     min-height: 0;
-    height: calc(100vh - 65px);
+    height: 0;
+    max-height: 100%;
     overflow: hidden;
 }
 
@@ -218,16 +232,18 @@ button {
     min-height: 0;
     max-height: 100%;
     overflow: hidden;
+    box-sizing: border-box;
 }
 
 .sidebar-top {
     padding: 1.25rem;
     display: flex;
     flex-direction: column;
-    flex: 0 1 auto;
+    flex: 0 0 auto;
     max-height: 35%;
     border-bottom: 1px solid var(--glass-border);
     overflow-y: auto;
+    box-sizing: border-box;
 }
 
 .sidebar-bottom {
@@ -236,8 +252,10 @@ button {
     flex-direction: column;
     flex: 1 1 0%;
     min-height: 0;
+    max-height: 65%;
     height: 0;
     overflow: hidden;
+    box-sizing: border-box;
 }
 
 .sidebar h3 {
@@ -258,14 +276,14 @@ button {
 .chat-messages {
     flex: 1 1 0%;
     min-height: 0;
+    max-height: 100%;
     height: 0;
     overflow-y: auto;
     overflow-x: hidden;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
+    display: block;
     margin-bottom: 0.75rem;
     padding-right: 0.25rem;
+    scroll-behavior: auto;
 }
 
 .chat-message {
@@ -274,6 +292,7 @@ button {
     padding: 0.5rem 0.75rem;
     border-radius: 8px;
     word-break: break-word;
+    margin-bottom: 0.5rem;
 }
 
 .chat-message strong {
@@ -338,7 +357,7 @@ button {
     border-radius: 12px;
     text-align: center;
     font-weight: 500;
-    margin-bottom: 1rem;
+    margin-bottom: 2rem;
     flex: 0 0 auto;
     animation: pulse 2s infinite;
 }
@@ -357,6 +376,8 @@ button {
     gap: 1.5rem;
     justify-content: center;
     align-items: flex-start;
+    padding-top: 2.5rem;
+    padding-bottom: 1rem;
     margin-bottom: 1rem;
     width: 100%;
     min-width: 0;
@@ -471,6 +492,7 @@ button {
     gap: 0.75rem;
     justify-content: center;
     align-items: flex-start;
+    padding-top: 0.5rem;
     width: 100%;
     min-width: 0;
 }
@@ -673,8 +695,11 @@ button {
 
     .game-layout {
         flex-direction: column;
+        flex: 1 1 0%;
+        min-height: 0;
+        height: 0;
+        max-height: 100%;
         overflow: hidden;
-        height: calc(100vh - 90px);
     }
     
     .sidebar {

@@ -400,15 +400,17 @@ class GameManager:
             return False, None
             
         custom_path = self._get_custom_file_path()
+        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
         custom_data = {"whiteCards": [], "blackCards": []}
-        if os.path.exists(custom_path):
+        
+        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
+        if target_path:
             try:
-                with open(custom_path, 'r', encoding='utf-8') as f:
+                with open(target_path, 'r', encoding='utf-8') as f:
                     custom_data = json.load(f)
             except Exception as e:
-                respond_cb({'success': False, 'message': f'Error leyendo cartasCustom.json: {str(e)}'})
-                return
-                
+                print("Error leyendo json custom:", e)
+
         if card_type == 'white':
             is_sim, match = check_sim(text, self.global_white_cards)
             if is_sim:
@@ -417,7 +419,8 @@ class GameManager:
             self.global_white_cards.append(text)
             if 'whiteCards' not in custom_data:
                 custom_data['whiteCards'] = []
-            custom_data['whiteCards'].append(text)
+            if text not in custom_data['whiteCards']:
+                custom_data['whiteCards'].append(text)
             for room in self.rooms.values():
                 room.available_whites.append(text)
                 random.shuffle(room.available_whites)
@@ -449,9 +452,12 @@ class GameManager:
     def get_custom_cards(self, respond_cb):
         import os
         custom_path = self._get_custom_file_path()
-        if os.path.exists(custom_path):
+        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
+        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
+        
+        if target_path:
             try:
-                with open(custom_path, 'r', encoding='utf-8') as f:
+                with open(target_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
                     return
@@ -463,11 +469,14 @@ class GameManager:
     def delete_custom_card(self, card_type, text, respond_cb):
         import os
         custom_path = self._get_custom_file_path()
-        if not os.path.exists(custom_path):
+        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
+        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
+        
+        if not target_path:
             respond_cb({'success': False, 'message': 'Archivo no encontrado.'})
             return
         try:
-            with open(custom_path, 'r', encoding='utf-8') as f:
+            with open(target_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             if card_type == 'white':

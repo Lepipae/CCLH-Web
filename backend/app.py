@@ -42,65 +42,70 @@ def cargar_cartas():
         print("Error cargando cartas base:", e)
 
     # Cargar y sincronizar cartasCustom.json con la carpeta externa
-    custom_path = os.path.join(base_dir, "DataScraping", "cartasCustom.json")
+    internal_custom_path = os.path.join(base_dir, "DataScraping", "cartasCustom.json")
     env_ext_dir = os.environ.get("EXTERNAL_CARDS_DIR")
     if env_ext_dir:
         ext_dir = os.path.abspath(env_ext_dir)
     else:
         ext_dir = os.path.abspath(os.path.join(base_dir, "..", "custom_cards"))
 
-    os.makedirs(os.path.dirname(custom_path), exist_ok=True)
+    os.makedirs(os.path.dirname(internal_custom_path), exist_ok=True)
     os.makedirs(ext_dir, exist_ok=True)
 
     custom_data = {"whiteCards": [], "blackCards": []}
-    if os.path.exists(custom_path):
-        try:
-            with open(custom_path, 'r', encoding='utf-8') as f:
-                custom_data = json.load(f)
-        except Exception as e:
-            print("Error leyendo cartasCustom.json:", e)
 
-    # Importar cartas desde archivos .json en la carpeta externa
-    imported_count = 0
+    def merge_cards(source_json):
+        if not isinstance(source_json, dict):
+            return
+        for w in source_json.get('whiteCards', []):
+            w_text = w if isinstance(w, str) else w.get('text', '')
+            if w_text and w_text not in [cw if isinstance(cw, str) else cw.get('text', '') for cw in custom_data['whiteCards']]:
+                custom_data['whiteCards'].append(w)
+                
+        for b in source_json.get('blackCards', []):
+            b_text = b if isinstance(b, str) else b.get('text', '')
+            if b_text and b_text not in [cb if isinstance(cb, str) else cb.get('text', '') for cb in custom_data['blackCards']]:
+                custom_data['blackCards'].append(b)
+
+    # 1. Intentar cargar desde custom_cards/cartasCustom.json (carpeta externa compartida con host)
+    ext_main_file = os.path.join(ext_dir, "cartasCustom.json")
+    if os.path.exists(ext_main_file):
+        try:
+            with open(ext_main_file, 'r', encoding='utf-8') as f:
+                merge_cards(json.load(f))
+        except Exception as e:
+            print("Error leyendo ext_main_file:", e)
+
+    # 2. Intentar cargar desde DataScraping/cartasCustom.json interno
+    if os.path.exists(internal_custom_path):
+        try:
+            with open(internal_custom_path, 'r', encoding='utf-8') as f:
+                merge_cards(json.load(f))
+        except Exception as e:
+            print("Error leyendo internal_custom_path:", e)
+
+    # 3. Cargar cualquier otro archivo .json en ext_dir
     if os.path.exists(ext_dir):
         for fname in os.listdir(ext_dir):
-            if fname.endswith(".json"):
+            if fname.endswith(".json") and fname != "cartasCustom.json":
                 fpath = os.path.join(ext_dir, fname)
                 try:
                     with open(fpath, 'r', encoding='utf-8') as f:
-                        ext_json = json.load(f)
-                        
-                        # Importar cartas blancas
-                        for w in ext_json.get('whiteCards', []):
-                            w_text = w if isinstance(w, str) else w.get('text', '')
-                            if w_text:
-                                exists = any((cw if isinstance(cw, str) else cw.get('text', '')) == w_text for cw in custom_data['whiteCards'])
-                                if not exists:
-                                    custom_data['whiteCards'].append(w)
-                                    imported_count += 1
-
-                        # Importar cartas negras
-                        for b in ext_json.get('blackCards', []):
-                            b_text = b if isinstance(b, str) else b.get('text', '')
-                            if b_text:
-                                exists = any((cb if isinstance(cb, str) else cb.get('text', '')) == b_text for cb in custom_data['blackCards'])
-                                if not exists:
-                                    custom_data['blackCards'].append(b)
-                                    imported_count += 1
+                        merge_cards(json.load(f))
                 except Exception as e:
                     print(f"Error importando archivo externo {fname}:", e)
 
-    # Guardar mazo sincronizado en interno y exportar a la carpeta externa
-    try:
-        with open(custom_path, 'w', encoding='utf-8') as f:
-            json.dump(custom_data, f, ensure_ascii=False, indent=2)
-            
-        ext_export_path = os.path.join(ext_dir, "cartasCustom.json")
-        with open(ext_export_path, 'w', encoding='utf-8') as f:
-            json.dump(custom_data, f, ensure_ascii=False, indent=2)
-        print(f"Cartas personalizadas sincronizadas ({ext_dir}): {len(custom_data.get('whiteCards', []))} blancas, {len(custom_data.get('blackCards', []))} negras.")
-    except Exception as e:
-        print("Error guardando sincronización de cartas custom:", e)
+    # Si hay cartas custom, sincronizar y guardar de forma segura en ambos sitios
+    if custom_data['whiteCards'] or custom_data['blackCards']:
+        try:
+            with open(internal_custom_path, 'w', encoding='utf-8') as f:
+                json.dump(custom_data, f, ensure_ascii=False, indent=2)
+            with open(ext_main_file, 'w', encoding='utf-8') as f:
+                json.dump(custom_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print("Error guardando sincronización de cartas custom:", e)
+
+    print(f"Cartas personalizadas sincronizadas ({ext_dir}): {len(custom_data.get('whiteCards', []))} blancas, {len(custom_data.get('blackCards', []))} negras.")
 
     c_whites = custom_data.get('whiteCards', [])
     c_blacks = custom_data.get('blackCards', [])
