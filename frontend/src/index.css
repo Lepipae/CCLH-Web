@@ -194,38 +194,42 @@ button {
 /* Game Layout */
 .game-layout {
     display: flex;
-    flex: 1;
+    flex: 1 1 0%;
     min-height: 0;
+    height: calc(100vh - 65px);
     overflow: hidden;
 }
 
 .sidebar {
     width: 280px;
+    flex: 0 0 280px;
     background: rgba(0, 0, 0, 0.2);
     border-right: 1px solid var(--glass-border);
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
+    max-height: 100%;
     overflow: hidden;
 }
 
 .sidebar-top {
-    padding: 1.5rem;
+    padding: 1.25rem;
     display: flex;
     flex-direction: column;
-    flex: 0 0 auto;
-    max-height: 45%;
+    flex: 0 1 auto;
+    max-height: 35%;
     border-bottom: 1px solid var(--glass-border);
     overflow-y: auto;
 }
 
 .sidebar-bottom {
-    padding: 1.5rem;
+    padding: 1.25rem;
     display: flex;
     flex-direction: column;
-    flex: 1;
+    flex: 1 1 0%;
     min-height: 0;
+    height: 0;
     overflow: hidden;
 }
 
@@ -234,23 +238,27 @@ button {
     text-transform: uppercase;
     font-size: 0.875rem;
     letter-spacing: 0.1em;
-    margin-bottom: 1rem;
+    margin-bottom: 0.75rem;
+    flex: 0 0 auto;
 }
 
 #leaderboard {
     list-style: none;
-    margin-bottom: 1rem;
+    margin-bottom: 0.5rem;
 }
 
 /* Chat Styles */
 .chat-messages {
-    flex: 1;
+    flex: 1 1 0%;
     min-height: 0;
+    height: 0;
     overflow-y: auto;
+    overflow-x: hidden;
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
-    margin-bottom: 1rem;
+    margin-bottom: 0.75rem;
+    padding-right: 0.25rem;
 }
 
 .chat-message {
@@ -642,41 +650,41 @@ button {
 /* Mobile Responsive */
 @media (max-width: 768px) {
     .screen {
-        height: auto;
-        min-height: 100vh;
-        max-height: none;
-        overflow-y: auto;
+        height: 100vh;
+        max-height: 100vh;
+        overflow: hidden;
     }
 
     .game-layout {
         flex-direction: column;
-        overflow: visible;
+        overflow: hidden;
+        height: calc(100vh - 90px);
     }
     
     .sidebar {
         width: 100%;
-        height: auto;
+        height: 180px;
+        max-height: 180px;
+        flex: 0 0 180px;
         border-right: none;
         border-bottom: 1px solid var(--glass-border);
-        flex: none;
         display: flex;
         flex-direction: column;
-        overflow: visible;
-    }
-    
-    .sidebar-top, .sidebar-bottom {
-        padding: 1rem;
+        overflow: hidden;
     }
     
     .sidebar-top {
-        max-height: none;
-        flex: none;
+        padding: 0.5rem 1rem;
+        max-height: 70px;
+        flex: 0 0 auto;
     }
     
     .sidebar-bottom {
-        height: 250px;
-        max-height: 250px;
-        flex: none;
+        padding: 0.5rem 1rem;
+        flex: 1 1 0%;
+        min-height: 0;
+        height: 0;
+        overflow: hidden;
     }
     
     .sidebar h3 {
