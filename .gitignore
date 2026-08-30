@@ -7,3 +7,4 @@ start.sh
 # Archivo local de cartas personalizadas
 backend/DataScraping/cartasCustom.json
 cartasCustom.json
+.env
