@@ -151,4 +151,4 @@ def on_send_chat(data):
     manager.send_chat(request.sid, data.get('room_id', '').upper(), data.get('msg', ''))
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=3000, debug=True)
+    socketio.run(app, host='0.0.0.0', port=3000, debug=False, allow_unsafe_werkzeug=True)

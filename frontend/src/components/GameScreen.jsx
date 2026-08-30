@@ -1,11 +1,12 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Copy, Sparkles, X } from 'lucide-react'
+import { Copy, Sparkles, X, Volume2, VolumeX } from 'lucide-react'
 import Leaderboard from './Leaderboard'
 import Chat from './Chat'
 import Card from './Card'
 import LobbyOptions from './LobbyOptions'
 import CustomCards from './CustomCards'
+import { soundManager } from '../utils/soundManager'
 
 export default function GameScreen({ gameState, mySid, socket }) {
   const { 
@@ -16,16 +17,26 @@ export default function GameScreen({ gameState, mySid, socket }) {
 
   const [selectedCards, setSelectedCards] = useState([])
   const [showCustomModal, setShowCustomModal] = useState(false)
+  const [isMuted, setIsMuted] = useState(soundManager.isMuted())
 
   const me = players.find(p => p.id === mySid)
   const isCzar = mySid === czar
   const isLeader = mySid === leader
   const canPlay = state === 'playing' && !isCzar && me && !me.has_played && !me.waiting_next_round
 
+  useEffect(() => {
+    if (state === 'round_end') {
+      soundManager.winRound()
+    }
+  }, [state])
+
   const handleStart = () => {
-    // If the inputs lost focus, options were sent.
-    // We just emit start.
     socket.emit('start_game', { room_id })
+  }
+
+  const handleToggleMute = () => {
+    const muted = soundManager.toggleMute()
+    setIsMuted(muted)
   }
 
   const handleCardClick = (index) => {
@@ -33,12 +44,15 @@ export default function GameScreen({ gameState, mySid, socket }) {
     const maxPicks = black_card?.pick || 1
 
     if (selectedCards.includes(index)) {
+      soundManager.selectCard()
       setSelectedCards(selectedCards.filter(i => i !== index))
     } else {
       if (selectedCards.length < maxPicks) {
+        soundManager.selectCard()
         const newSel = [...selectedCards, index]
         setSelectedCards(newSel)
         if (newSel.length === maxPicks) {
+          soundManager.playCard()
           socket.emit('play_card', { room_id, card_index: newSel })
           setSelectedCards([])
         }
@@ -48,6 +62,7 @@ export default function GameScreen({ gameState, mySid, socket }) {
 
   const handleVoteCard = (cardId) => {
     if (!isCzar && (state === 'judging' || state === 'round_end')) {
+      soundManager.voteCard()
       socket.emit('vote_card', { room_id, card_id: cardId })
     }
   }
@@ -73,8 +88,16 @@ export default function GameScreen({ gameState, mySid, socket }) {
           <span id="player-name">{me?.name || 'Espectador'}</span>
           {isCzar && <span className="badge">🔨 Juez</span>}
           <button 
+            className="btn-secondary"
+            style={{ padding: '0.4rem 0.6rem', display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: 0 }}
+            onClick={handleToggleMute}
+            title={isMuted ? 'Activar sonido' : 'Silenciar sonido'}
+          >
+            {isMuted ? <VolumeX size={18} color="#ef4444" /> : <Volume2 size={18} color="#10b981" />}
+          </button>
+          <button 
             className="btn-secondary" 
-            style={{ padding: '0.4rem 0.8rem', display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 0 }} 
+            style={{ padding: '0.4rem 0.8rem', display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: 0 }} 
             onClick={() => {
               const inviteUrl = `${window.location.origin}${window.location.pathname}?room=${room_id}`
               navigator.clipboard.writeText(inviteUrl)
@@ -172,10 +195,12 @@ export default function GameScreen({ gameState, mySid, socket }) {
                         onClick={() => {
                           if (state === 'judging' && isCzar) {
                             if (!pc.revealed) {
+                              soundManager.revealCard()
                               socket.emit('reveal_card', { room_id, sub_id: pc.id })
                             } else {
                               const allRevealed = played_cards.every(c => c.revealed);
                               if (allRevealed) {
+                                soundManager.winRound()
                                 socket.emit('choose_winner', { room_id, sub_id: pc.id })
                               } else {
                                 alert('¡Debes revelar todas las cartas antes de elegir un ganador!');

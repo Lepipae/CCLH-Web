@@ -23,3 +23,30 @@ services:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     depends_on:
       - app
+
+  ngrok-url:
+    image: curlimages/curl:latest
+    container_name: cclh_ngrok_url
+    depends_on:
+      - ngrok
+    restart: "no"
+    entrypoint:
+      - "sh"
+      - "-c"
+      - |
+        echo "Esperando a que ngrok genere el enlace público..."
+        for i in $$(seq 1 25); do
+          sleep 1
+          URL=$$(curl -s http://ngrok:4040/api/tunnels | grep -o '"public_url":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+          if [ -n "$$URL" ]; then
+            echo ""
+            echo "=================================================================="
+            echo "  🚀 ¡PARTIDA LISTA! TU ENLACE PÚBLICO DE NGROK ES:"
+            echo "  👉  $$URL  👈"
+            echo "  Comparte este enlace para que los jugadores se unan."
+            echo "=================================================================="
+            echo ""
+            exit 0
+          fi
+        done
+        echo "⚠️ No se pudo obtener la URL de ngrok. Verifica que tu NGROK_AUTHTOKEN esté configurado en el archivo .env."

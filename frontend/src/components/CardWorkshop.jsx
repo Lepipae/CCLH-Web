@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { ArrowLeft, Plus, Trash2, FileCode, CheckCircle, AlertCircle } from 'lucide-react'
 import Card from './Card'
+import { soundManager } from '../utils/soundManager'
 
 export default function CardWorkshop({ socket, onBack }) {
   const [cardType, setCardType] = useState('white')
@@ -79,6 +80,7 @@ export default function CardWorkshop({ socket, onBack }) {
       return
     }
 
+    soundManager.playCard()
     setLoading(true)
     socket.emit('add_custom_card', {
       type: cardType,

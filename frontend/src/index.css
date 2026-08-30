@@ -370,10 +370,9 @@ button {
     min-height: 0;
     max-height: 100%;
     overflow: hidden;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-    word-wrap: break-word;
-    hyphens: auto;
+    overflow-wrap: break-word;
+    word-break: normal;
+    hyphens: none;
 }
 
 .card-footer {
