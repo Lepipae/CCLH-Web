@@ -324,13 +324,19 @@ class GameManager:
                 self.send_chat_system(room_id, 'El juez ha cambiado la carta negra. ¡Tenéis que volver a jugar!')
                 self.send_room_update(room_id)
 
+    def _get_custom_file_path(self):
+        import os
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.abspath(os.path.join(base_dir, "..", "DataScraping", "cartasCustom.json"))
+
     def add_custom_card(self, card_type, text, pick, respond_cb):
+        import os
         text = text.strip()
         if not text:
             respond_cb({'success': False, 'message': 'El texto está vacío.'})
             return
             
-        def check_sim(new_txt, lst, thresh=0.8):
+        def check_sim(new_txt, lst, thresh=0.85):
             n_l = new_txt.lower()
             for c in lst:
                 tc = c if isinstance(c, str) else c.get('text', '')
@@ -338,49 +344,94 @@ class GameManager:
                     return True, tc
             return False, None
             
-        try:
-            with open('DataScraping/CAH-es-set-actualizado.json', 'r', encoding='utf-8') as f:
-                full_data = json.load(f)
-        except Exception:
+        custom_path = self._get_custom_file_path()
+        custom_data = {"whiteCards": [], "blackCards": []}
+        if os.path.exists(custom_path):
             try:
-                with open('www/Cartas/CAH-es-set.json', 'r', encoding='utf-8') as f:
-                    full_data = json.load(f)
+                with open(custom_path, 'r', encoding='utf-8') as f:
+                    custom_data = json.load(f)
             except Exception as e:
-                respond_cb({'success': False, 'message': f'Error leyendo JSON: {str(e)}'})
+                respond_cb({'success': False, 'message': f'Error leyendo cartasCustom.json: {str(e)}'})
                 return
                 
         if card_type == 'white':
             is_sim, match = check_sim(text, self.global_white_cards)
             if is_sim:
-                respond_cb({'success': False, 'message': f'Muy similar a: "{match}"'})
+                respond_cb({'success': False, 'message': f'Muy similar a una carta existente: "{match}"'})
                 return
             self.global_white_cards.append(text)
-            full_data['whiteCards'].append(text)
+            if 'whiteCards' not in custom_data:
+                custom_data['whiteCards'] = []
+            custom_data['whiteCards'].append(text)
             for room in self.rooms.values():
                 room.available_whites.append(text)
                 random.shuffle(room.available_whites)
         elif card_type == 'black':
             is_sim, match = check_sim(text, self.global_black_cards)
             if is_sim:
-                respond_cb({'success': False, 'message': f'Muy similar a: "{match}"'})
+                respond_cb({'success': False, 'message': f'Muy similar a una carta existente: "{match}"'})
                 return
             new_c = {'text': text, 'pick': pick}
             self.global_black_cards.append(new_c)
-            full_data['blackCards'].append(new_c)
+            if 'blackCards' not in custom_data:
+                custom_data['blackCards'] = []
+            custom_data['blackCards'].append(new_c)
             for room in self.rooms.values():
                 room.available_blacks.append(new_c)
                 random.shuffle(room.available_blacks)
         else:
-            respond_cb({'success': False, 'message': 'Tipo inválido.'})
+            respond_cb({'success': False, 'message': 'Tipo de carta inválido.'})
             return
             
         try:
-            with open('DataScraping/CAH-es-set-actualizado.json', 'w', encoding='utf-8') as f:
-                json.dump(full_data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+            os.makedirs(os.path.dirname(custom_path), exist_ok=True)
+            with open(custom_path, 'w', encoding='utf-8') as f:
+                json.dump(custom_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            respond_cb({'success': False, 'message': f'Error guardando cartasCustom.json: {str(e)}'})
+            return
             
-        respond_cb({'success': True})
+        respond_cb({'success': True, 'whiteCards': custom_data.get('whiteCards', []), 'blackCards': custom_data.get('blackCards', [])})
+
+    def get_custom_cards(self, respond_cb):
+        import os
+        custom_path = self._get_custom_file_path()
+        if os.path.exists(custom_path):
+            try:
+                with open(custom_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
+                    return
+            except Exception as e:
+                respond_cb({'success': False, 'message': str(e)})
+                return
+        respond_cb({'success': True, 'whiteCards': [], 'blackCards': []})
+
+    def delete_custom_card(self, card_type, text, respond_cb):
+        import os
+        custom_path = self._get_custom_file_path()
+        if not os.path.exists(custom_path):
+            respond_cb({'success': False, 'message': 'Archivo no encontrado.'})
+            return
+        try:
+            with open(custom_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            if card_type == 'white':
+                w_list = data.get('whiteCards', [])
+                data['whiteCards'] = [c for c in w_list if (c if isinstance(c, str) else c.get('text')) != text]
+                if text in self.global_white_cards:
+                    self.global_white_cards.remove(text)
+            elif card_type == 'black':
+                b_list = data.get('blackCards', [])
+                data['blackCards'] = [c for c in b_list if (c if isinstance(c, str) else c.get('text')) != text]
+                self.global_black_cards = [c for c in self.global_black_cards if (c if isinstance(c, str) else c.get('text')) != text]
+            
+            with open(custom_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
+        except Exception as e:
+            respond_cb({'success': False, 'message': str(e)})
 
     def add_room_cards(self, room_id, cards_str):
         if room_id in self.rooms:

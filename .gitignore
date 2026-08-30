@@ -3,3 +3,7 @@ ngrok.log
 start_ngrok.sh
 stop_game.sh
 start.sh
+
+# Archivo local de cartas personalizadas
+backend/DataScraping/cartasCustom.json
+cartasCustom.json

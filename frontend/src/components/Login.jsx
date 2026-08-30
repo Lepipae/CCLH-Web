@@ -1,7 +1,8 @@
 import React, { useState } from 'react'
 import { motion } from 'framer-motion'
+import { Palette } from 'lucide-react'
 
-export default function Login({ onJoin }) {
+export default function Login({ onJoin, onOpenWorkshop }) {
   const [name, setName] = useState('')
   const [room, setRoom] = useState(() => {
     const params = new URLSearchParams(window.location.search)
@@ -63,7 +64,28 @@ export default function Login({ onJoin }) {
             Entrar a la Sala
           </motion.button>
         </form>
+
+        <div style={{ marginTop: '1.5rem', paddingTop: '1.25rem', borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
+          <button 
+            type="button" 
+            className="btn-secondary"
+            onClick={onOpenWorkshop}
+            style={{ 
+              marginTop: 0, 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'center', 
+              gap: '0.5rem',
+              background: 'rgba(167, 139, 250, 0.1)',
+              borderColor: 'rgba(167, 139, 250, 0.3)'
+            }}
+          >
+            <Palette size={18} color="#a78bfa" />
+            Taller de Cartas Custom
+          </button>
+        </div>
       </motion.div>
     </div>
   )
 }
+

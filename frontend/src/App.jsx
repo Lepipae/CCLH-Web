@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { io } from 'socket.io-client'
 import Login from './components/Login'
 import GameScreen from './components/GameScreen'
+import CardWorkshop from './components/CardWorkshop'
 
 const socket = io()
 
@@ -9,6 +10,7 @@ function App() {
   const [inGame, setInGame] = useState(false)
   const [gameState, setGameState] = useState(null)
   const [mySid, setMySid] = useState(null)
+  const [view, setView] = useState('login') // 'login' | 'workshop' | 'game'
 
   useEffect(() => {
     socket.on('connect', () => {
@@ -17,11 +19,14 @@ function App() {
 
     socket.on('game_update', (data) => {
       setGameState(data)
+      setInGame(true)
+      setView('game')
     })
 
     socket.on('join_error', (data) => {
       alert(data.message)
       setInGame(false)
+      setView('login')
     })
 
     return () => {
@@ -33,20 +38,29 @@ function App() {
 
   const handleJoin = (name, room) => {
     socket.emit('join_game', { name, room_id: room })
-    setInGame(true)
   }
 
-  if (!inGame || !gameState) {
-    return <Login onJoin={handleJoin} />
+  if (view === 'workshop') {
+    return <CardWorkshop socket={socket} onBack={() => setView('login')} />
+  }
+
+  if (view === 'game' && inGame && gameState) {
+    return (
+      <GameScreen 
+        gameState={gameState} 
+        mySid={mySid} 
+        socket={socket} 
+      />
+    )
   }
 
   return (
-    <GameScreen 
-      gameState={gameState} 
-      mySid={mySid} 
-      socket={socket} 
+    <Login 
+      onJoin={handleJoin} 
+      onOpenWorkshop={() => setView('workshop')} 
     />
   )
 }
 
 export default App
+

@@ -1,10 +1,11 @@
 import React, { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Copy } from 'lucide-react'
+import { Copy, Sparkles, X } from 'lucide-react'
 import Leaderboard from './Leaderboard'
 import Chat from './Chat'
 import Card from './Card'
 import LobbyOptions from './LobbyOptions'
+import CustomCards from './CustomCards'
 
 export default function GameScreen({ gameState, mySid, socket }) {
   const { 
@@ -14,6 +15,7 @@ export default function GameScreen({ gameState, mySid, socket }) {
   } = gameState
 
   const [selectedCards, setSelectedCards] = useState([])
+  const [showCustomModal, setShowCustomModal] = useState(false)
 
   const me = players.find(p => p.id === mySid)
   const isCzar = mySid === czar
@@ -86,7 +88,7 @@ export default function GameScreen({ gameState, mySid, socket }) {
 
         <main className="board">
           {state === 'waiting' ? (
-            <div className="glass-panel" style={{ margin: 'auto' }}>
+            <div className="glass-panel" style={{ margin: 'auto', maxWidth: '550px', width: '90%' }}>
               <h2>
                 {players.length < 2 
                   ? 'Esperando jugadores...' 
@@ -102,17 +104,20 @@ export default function GameScreen({ gameState, mySid, socket }) {
                     : 'El líder está configurando la sala y pronto iniciará la partida.'}
               </p>
               {isLeader && (
-                <>
-                  <LobbyOptions socket={socket} roomId={room_id} options={options} />
-                  <button 
-                    className="btn-primary" 
-                    onClick={handleStart} 
-                    disabled={players.length < 2}
-                    style={{ marginTop: '1rem', opacity: players.length < 2 ? 0.5 : 1, cursor: players.length < 2 ? 'not-allowed' : 'pointer' }}
-                  >
-                    {players.length < 2 ? 'Faltan jugadores' : 'Iniciar Partida'}
-                  </button>
-                </>
+                <LobbyOptions socket={socket} roomId={room_id} options={options} />
+              )}
+              
+              <CustomCards socket={socket} roomId={room_id} />
+
+              {isLeader && (
+                <button 
+                  className="btn-primary" 
+                  onClick={handleStart} 
+                  disabled={players.length < 2}
+                  style={{ marginTop: '1.5rem', opacity: players.length < 2 ? 0.5 : 1, cursor: players.length < 2 ? 'not-allowed' : 'pointer' }}
+                >
+                  {players.length < 2 ? 'Faltan jugadores' : 'Iniciar Partida'}
+                </button>
               )}
             </div>
           ) : (
@@ -196,12 +201,22 @@ export default function GameScreen({ gameState, mySid, socket }) {
                 </div>
               </div>
 
-              <div id="game-controls" style={{ display: 'flex', gap: '1rem', justifyContent: 'center', marginBottom: '2rem' }}>
+              <div id="game-controls" style={{ display: 'flex', gap: '1rem', justifyContent: 'center', marginBottom: '2rem', flexWrap: 'wrap' }}>
+                <button 
+                  className="btn-secondary" 
+                  onClick={() => setShowCustomModal(true)}
+                  style={{ width: 'auto', marginTop: 0 }}
+                >
+                  <Sparkles size={16} style={{ display: 'inline', marginRight: '0.4rem', verticalAlign: 'middle' }} />
+                  Cartas Custom
+                </button>
                 {!isCzar && (
                   <button 
                     className="btn-secondary" 
                     onClick={handleRenew} 
                     style={{ 
+                      width: 'auto',
+                      marginTop: 0,
                       background: has_voted_renew ? 'rgba(59, 130, 246, 0.3)' : undefined,
                       borderColor: has_voted_renew ? 'var(--accent-primary)' : undefined
                     }}
@@ -213,12 +228,12 @@ export default function GameScreen({ gameState, mySid, socket }) {
                   </button>
                 )}
                 {isCzar && state === 'playing' && (
-                  <button className="btn-secondary" onClick={handleChangeBlack}>
+                  <button className="btn-secondary" onClick={handleChangeBlack} style={{ width: 'auto', marginTop: 0 }}>
                     Cambiar Carta Negra
                   </button>
                 )}
                 {isCzar && state === 'round_end' && (
-                  <button className="btn-primary" onClick={() => socket.emit('next_round', { room_id })}>
+                  <button className="btn-primary" onClick={() => socket.emit('next_round', { room_id })} style={{ width: 'auto', marginTop: 0 }}>
                     Siguiente Ronda
                   </button>
                 )}
@@ -248,6 +263,40 @@ export default function GameScreen({ gameState, mySid, socket }) {
           )}
         </main>
       </div>
+
+      {showCustomModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0, 0, 0, 0.7)',
+          backdropFilter: 'blur(8px)',
+          zIndex: 1000,
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          padding: '1rem'
+        }}>
+          <div className="glass-panel" style={{ maxWidth: '500px', width: '100%', position: 'relative' }}>
+            <button 
+              onClick={() => setShowCustomModal(false)}
+              style={{
+                position: 'absolute',
+                top: '1rem',
+                right: '1rem',
+                background: 'transparent',
+                border: 'none',
+                color: 'var(--text-secondary)',
+                cursor: 'pointer'
+              }}
+            >
+              <X size={20} />
+            </button>
+            <CustomCards socket={socket} roomId={room_id} />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
+
+
