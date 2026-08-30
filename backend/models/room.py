@@ -59,19 +59,29 @@ class Room:
         played_cards_public = []
         if self.state in ['judging', 'round_end']:
             for c in self.played_cards:
-                if c.get('revealed') or self.state == 'round_end':
-                    played_cards_public.append({
-                        'id': c['id'], 
-                        'cards': c['cards'], 
-                        'revealed': True, 
-                        'sid': c['sid'] if self.state == 'round_end' else None
-                    })
-                else:
-                    played_cards_public.append({'id': c['id'], 'cards': [], 'revealed': False, 'sid': None})
+                votes = c.get('votes', set())
+                is_revealed = bool(c.get('revealed') or self.state == 'round_end')
+                played_cards_public.append({
+                    'id': c['id'], 
+                    'cards': c['cards'] if is_revealed else [], 
+                    'revealed': is_revealed, 
+                    'sid': c['sid'] if self.state == 'round_end' else None,
+                    'votes_count': len(votes),
+                    'has_voted': for_sid in votes,
+                    'is_mine': (c.get('sid') == for_sid)
+                })
         elif self.state == 'playing':
             # Mostrar las cartas boca abajo mientras la gente está jugando
             for c in self.played_cards:
-                played_cards_public.append({'id': c['id'], 'cards': [], 'revealed': False, 'sid': None})
+                played_cards_public.append({
+                    'id': c['id'], 
+                    'cards': [], 
+                    'revealed': False, 
+                    'sid': None,
+                    'votes_count': 0,
+                    'has_voted': False,
+                    'is_mine': (c.get('sid') == for_sid)
+                })
                     
         active_players = self.get_active_players()
         voters = [p for p in active_players if p.sid != self.czar and not p.waiting_next_round]

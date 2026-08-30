@@ -1,5 +1,6 @@
 import React, { useRef, useLayoutEffect } from 'react'
 import { motion } from 'framer-motion'
+import { Heart } from 'lucide-react'
 
 export default function Card({ 
   text, 
@@ -12,7 +13,12 @@ export default function Card({
   isWinner = false,
   isLoser = false,
   selectionOrder = null,
-  author = null
+  author = null,
+  votesCount = 0,
+  hasVoted = false,
+  isVotable = false,
+  isMine = false,
+  onVote = null
 }) {
   const cardRef = useRef(null)
   const textRef = useRef(null)
@@ -73,6 +79,8 @@ export default function Card({
   if (isWinner) className += ' winner-card winner-animation'
   if (isLoser) className += ' loser-fade'
 
+  const showVoteBadge = !isFaceDown && (votesCount > 0 || isVotable || isMine)
+
   return (
     <motion.div 
       ref={cardRef}
@@ -98,6 +106,30 @@ export default function Card({
         <div className="card-footer">
           Cartas Contra Miedo Y Hambre {pick > 1 && `(ROBA ${pick})`}
         </div>
+      )}
+
+      {showVoteBadge && (
+        <button
+          type="button"
+          className={`card-vote-badge ${hasVoted ? 'voted' : ''} ${isMine ? 'mine' : ''}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            if (isVotable && onVote) {
+              onVote()
+            }
+          }}
+          disabled={!isVotable || isMine}
+          title={
+            isMine 
+              ? 'Esta es tu carta (no puedes votarla)' 
+              : isVotable 
+                ? (hasVoted ? 'Quitar voto favorito' : 'Votar como tu favorita ❤️') 
+                : `${votesCount} voto${votesCount !== 1 ? 's' : ''}`
+          }
+        >
+          <Heart size={13} fill={hasVoted ? "#ffffff" : "currentColor"} color={hasVoted ? "#ffffff" : "currentColor"} />
+          {votesCount > 0 && <span className="vote-count">{votesCount}</span>}
+        </button>
       )}
     </motion.div>
   )

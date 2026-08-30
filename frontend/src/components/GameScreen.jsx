@@ -46,6 +46,12 @@ export default function GameScreen({ gameState, mySid, socket }) {
     }
   }
 
+  const handleVoteCard = (cardId) => {
+    if (!isCzar && (state === 'judging' || state === 'round_end')) {
+      socket.emit('vote_card', { room_id, card_id: cardId })
+    }
+  }
+
   const handleRenew = () => {
     socket.emit('vote_renew', { room_id })
   }
@@ -187,6 +193,11 @@ export default function GameScreen({ gameState, mySid, socket }) {
                               isWinner={state === 'round_end' && pc.sid === winner_sid}
                               isLoser={state === 'round_end' && pc.sid !== winner_sid}
                               isPlayable={state === 'judging' && isCzar}
+                              votesCount={idx === pc.cards.length - 1 ? (pc.votes_count || 0) : 0}
+                              hasVoted={idx === pc.cards.length - 1 ? Boolean(pc.has_voted) : false}
+                              isVotable={!isCzar && (state === 'judging' || state === 'round_end') && !pc.is_mine && idx === pc.cards.length - 1}
+                              isMine={pc.is_mine}
+                              onVote={() => handleVoteCard(pc.id)}
                             />
                           ))
                         ) : (

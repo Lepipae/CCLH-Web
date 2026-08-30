@@ -108,6 +108,10 @@ def on_reveal_card(data):
 def on_choose_winner(data):
     manager.choose_winner(request.sid, data.get('room_id', '').upper(), data.get('sub_id'))
 
+@socketio.on('vote_card')
+def on_vote_card(data):
+    manager.vote_card(request.sid, data.get('room_id', '').upper(), data.get('card_id'))
+
 @socketio.on('next_round')
 def on_next_round(data):
     manager.force_next_round(request.sid, data.get('room_id', '').upper())

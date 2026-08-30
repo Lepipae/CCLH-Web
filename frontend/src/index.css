@@ -393,6 +393,52 @@ button {
     margin-bottom: 0.5rem;
 }
 
+/* Card Vote Badge (Heart in bottom-right corner) */
+.card-vote-badge {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #f43f5e;
+    font-size: 0.75rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.card-vote-badge:hover:not(:disabled) {
+    transform: scale(1.15);
+    background: rgba(244, 63, 94, 0.25);
+    border-color: #f43f5e;
+}
+
+.card-vote-badge.voted {
+    background: linear-gradient(135deg, #ef4444, #ec4899);
+    color: #ffffff;
+    border-color: #f87171;
+    box-shadow: 0 0 12px rgba(239, 68, 68, 0.6);
+}
+
+.card-vote-badge.mine {
+    opacity: 0.5;
+    cursor: not-allowed;
+    color: var(--text-secondary);
+}
+
+.card-vote-badge:disabled:not(.mine) {
+    cursor: default;
+}
+
 .played-cards {
     display: flex;
     flex: 1;

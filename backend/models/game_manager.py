@@ -260,6 +260,37 @@ class GameManager:
                     
             self.send_room_update(room_id)
 
+    def vote_card(self, sid, room_id, card_id):
+        if room_id in self.rooms:
+            room = self.rooms[room_id]
+            if room.state in ['judging', 'round_end'] and sid != room.czar and sid in room.players:
+                target_sub = None
+                for c in room.played_cards:
+                    if c.get('id') == card_id:
+                        target_sub = c
+                        break
+                        
+                if target_sub:
+                    # Un jugador no puede votar por su propia carta
+                    if target_sub.get('sid') == sid:
+                        return
+                        
+                    if 'votes' not in target_sub or not isinstance(target_sub['votes'], set):
+                        target_sub['votes'] = set()
+                        
+                    has_voted_this = sid in target_sub['votes']
+                    
+                    # Quitar voto previo de cualquier otra carta en esta sala
+                    for c in room.played_cards:
+                        if 'votes' in c and isinstance(c['votes'], set):
+                            c['votes'].discard(sid)
+                            
+                    # Alternar voto: si no estaba votado, lo añade
+                    if not has_voted_this:
+                        target_sub['votes'].add(sid)
+                        
+                self.send_room_update(room_id)
+
     def vote_renew(self, sid, room_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
