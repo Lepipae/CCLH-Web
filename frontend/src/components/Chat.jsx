@@ -5,7 +5,7 @@ import { Send } from 'lucide-react'
 export default function Chat({ socket, room_id }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
-  const messagesEndRef = useRef(null)
+  const chatMessagesRef = useRef(null)
 
   useEffect(() => {
     const handleChat = (data) => {
@@ -17,7 +17,12 @@ export default function Chat({ socket, room_id }) {
   }, [socket])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (chatMessagesRef.current) {
+      chatMessagesRef.current.scrollTo({
+        top: chatMessagesRef.current.scrollHeight,
+        behavior: 'smooth'
+      })
+    }
   }, [messages])
 
   const sendChat = (e) => {
@@ -31,7 +36,7 @@ export default function Chat({ socket, room_id }) {
   return (
     <div className="sidebar-bottom">
       <h3>Chat</h3>
-      <div className="chat-messages">
+      <div className="chat-messages" ref={chatMessagesRef}>
         <AnimatePresence>
           {messages.map((m, i) => (
             <motion.div 
@@ -45,7 +50,6 @@ export default function Chat({ socket, room_id }) {
             </motion.div>
           ))}
         </AnimatePresence>
-        <div ref={messagesEndRef} />
       </div>
       <form className="chat-input-area" onSubmit={sendChat}>
         <input 
