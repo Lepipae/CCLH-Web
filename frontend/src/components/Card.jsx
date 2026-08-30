@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useRef, useLayoutEffect } from 'react'
 import { motion } from 'framer-motion'
 
 export default function Card({ 
@@ -14,7 +14,58 @@ export default function Card({
   selectionOrder = null,
   author = null
 }) {
-  
+  const cardRef = useRef(null)
+  const textRef = useRef(null)
+
+  useLayoutEffect(() => {
+    const textEl = textRef.current
+    const cardEl = cardRef.current
+    if (!textEl || !cardEl || isFaceDown) return
+
+    let animationFrameId = null
+
+    const fitText = () => {
+      if (!textEl || !cardEl) return
+
+      textEl.style.fontSize = ''
+
+      const cardHeight = cardEl.clientHeight
+      const textHeight = textEl.clientHeight
+      if (cardHeight <= 0 || textHeight <= 0) return
+
+      const computed = window.getComputedStyle(textEl)
+      let currentPx = parseFloat(computed.fontSize) || 20
+      const minPx = 8
+
+      textEl.style.fontSize = `${currentPx}px`
+
+      const isOverflowing = () => {
+        const textOverflow = textEl.scrollHeight > textEl.clientHeight + 1 || textEl.scrollWidth > textEl.clientWidth + 1
+        const cardOverflow = cardEl.scrollHeight > cardEl.clientHeight + 1
+        return textOverflow || cardOverflow
+      }
+
+      while (isOverflowing() && currentPx > minPx) {
+        currentPx -= 0.5
+        textEl.style.fontSize = `${currentPx}px`
+      }
+    }
+
+    fitText()
+    animationFrameId = requestAnimationFrame(fitText)
+
+    const ro = new ResizeObserver(() => {
+      fitText()
+    })
+    ro.observe(cardEl)
+    ro.observe(textEl)
+
+    return () => {
+      if (animationFrameId) cancelAnimationFrame(animationFrameId)
+      ro.disconnect()
+    }
+  }, [text, isFaceDown])
+
   let className = `card ${type}`
   if (isPlayable) className += ' playable'
   if (isSelected) className += ' selected'
@@ -24,6 +75,7 @@ export default function Card({
 
   return (
     <motion.div 
+      ref={cardRef}
       className={className}
       onClick={isPlayable ? onClick : undefined}
       data-selection-order={selectionOrder}
@@ -34,7 +86,7 @@ export default function Card({
       transition={{ type: 'spring', stiffness: 300, damping: 20 }}
       layout
     >
-      <div className="card-text">
+      <div className="card-text" ref={textRef}>
         {!isFaceDown && text}
       </div>
       
@@ -50,3 +102,4 @@ export default function Card({
     </motion.div>
   )
 }
+
