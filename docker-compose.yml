@@ -9,7 +9,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./backend/DataScraping/cartasCustom.json:/app/backend/DataScraping/cartasCustom.json
+      - ./backend/DataScraping:/app/backend/DataScraping
       - ./custom_cards:/app/custom_cards
     restart: unless-stopped
 
