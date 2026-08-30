@@ -8,6 +8,9 @@ services:
     container_name: cclh_app
     ports:
       - "3000:3000"
+    volumes:
+      - ./backend/DataScraping/cartasCustom.json:/app/backend/DataScraping/cartasCustom.json
+      - ./custom_cards:/app/custom_cards
     restart: unless-stopped
 
   ngrok:

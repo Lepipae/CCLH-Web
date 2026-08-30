@@ -360,6 +360,30 @@ class GameManager:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         return os.path.abspath(os.path.join(base_dir, "..", "DataScraping", "cartasCustom.json"))
 
+    def _get_external_custom_dir(self):
+        import os
+        env_dir = os.environ.get("EXTERNAL_CARDS_DIR")
+        if env_dir:
+            return os.path.abspath(env_dir)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.abspath(os.path.join(base_dir, "..", "..", "custom_cards"))
+
+    def _save_custom_data(self, custom_data):
+        import os
+        internal_path = self._get_custom_file_path()
+        os.makedirs(os.path.dirname(internal_path), exist_ok=True)
+        with open(internal_path, 'w', encoding='utf-8') as f:
+            json.dump(custom_data, f, ensure_ascii=False, indent=2)
+
+        try:
+            external_dir = self._get_external_custom_dir()
+            os.makedirs(external_dir, exist_ok=True)
+            external_path = os.path.join(external_dir, "cartasCustom.json")
+            with open(external_path, 'w', encoding='utf-8') as f:
+                json.dump(custom_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print("Error exportando cartas a carpeta externa:", e)
+
     def add_custom_card(self, card_type, text, pick, respond_cb):
         import os
         text = text.strip()
@@ -415,11 +439,9 @@ class GameManager:
             return
             
         try:
-            os.makedirs(os.path.dirname(custom_path), exist_ok=True)
-            with open(custom_path, 'w', encoding='utf-8') as f:
-                json.dump(custom_data, f, ensure_ascii=False, indent=2)
+            self._save_custom_data(custom_data)
         except Exception as e:
-            respond_cb({'success': False, 'message': f'Error guardando cartasCustom.json: {str(e)}'})
+            respond_cb({'success': False, 'message': f'Error guardando cartas custom: {str(e)}'})
             return
             
         respond_cb({'success': True, 'whiteCards': custom_data.get('whiteCards', []), 'blackCards': custom_data.get('blackCards', [])})
@@ -458,8 +480,7 @@ class GameManager:
                 data['blackCards'] = [c for c in b_list if (c if isinstance(c, str) else c.get('text')) != text]
                 self.global_black_cards = [c for c in self.global_black_cards if (c if isinstance(c, str) else c.get('text')) != text]
             
-            with open(custom_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._save_custom_data(data)
             respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
         except Exception as e:
             respond_cb({'success': False, 'message': str(e)})
