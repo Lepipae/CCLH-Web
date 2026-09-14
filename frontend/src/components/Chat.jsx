@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
 import { Send } from 'lucide-react'
+
+const MAX_MESSAGES = 200
 
 export default function Chat({ socket, room_id }) {
   const [messages, setMessages] = useState([])
@@ -9,9 +10,13 @@ export default function Chat({ socket, room_id }) {
 
   useEffect(() => {
     const handleChat = (data) => {
-      setMessages(prev => [...prev, data])
+      setMessages(prev => {
+        const next = [...prev, data]
+        // Cap the history so heavy spamming can't grow the DOM/memory unbounded
+        return next.length > MAX_MESSAGES ? next.slice(next.length - MAX_MESSAGES) : next
+      })
     }
-    
+
     socket.on('chat_message', handleChat)
     return () => socket.off('chat_message', handleChat)
   }, [socket])

@@ -8,3 +8,7 @@ start.sh
 backend/DataScraping/cartasCustom.json
 cartasCustom.json
 .env
+
+__pycache__/
+*.pyc
+.freebuff/project-id
