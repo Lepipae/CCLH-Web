@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Copy, Sparkles, X, Volume2, VolumeX } from 'lucide-react'
 import Leaderboard from './Leaderboard'
+import PlayersBanner from './PlayersBanner'
 import Chat from './Chat'
 import Card from './Card'
 import LobbyOptions from './LobbyOptions'
@@ -18,6 +19,9 @@ export default function GameScreen({ gameState, mySid, socket }) {
   const [selectedCards, setSelectedCards] = useState([])
   const [showCustomModal, setShowCustomModal] = useState(false)
   const [isMuted, setIsMuted] = useState(soundManager.isMuted())
+  const [chatMessages, setChatMessages] = useState([])
+  const [chatOpen, setChatOpen] = useState(false)
+  const [unreadChat, setUnreadChat] = useState(0)
 
   const me = players.find(p => p.id === mySid)
   const isCzar = mySid === czar
@@ -29,6 +33,24 @@ export default function GameScreen({ gameState, mySid, socket }) {
       soundManager.winRound()
     }
   }, [state])
+
+  // Single socket listener owns chat history so the drawer keeps it while closed
+  const MAX_CHAT = 200
+  useEffect(() => {
+    const handleChat = (data) => {
+      setChatMessages(prev => {
+        const next = [...prev, data]
+        return next.length > MAX_CHAT ? next.slice(next.length - MAX_CHAT) : next
+      })
+      if (!chatOpen) setUnreadChat(c => c + 1)
+    }
+    socket.on('chat_message', handleChat)
+    return () => socket.off('chat_message', handleChat)
+  }, [socket, chatOpen])
+
+  const handleSendChat = (msg) => {
+    socket.emit('send_chat', { room_id, msg })
+  }
 
   const handleStart = () => {
     socket.emit('start_game', { room_id })
@@ -110,9 +132,14 @@ export default function GameScreen({ gameState, mySid, socket }) {
       </header>
 
       <div className="game-layout">
+        <PlayersBanner
+          players={players}
+          onOpenChat={() => { setChatOpen(true); setUnreadChat(0) }}
+          unreadCount={unreadChat}
+        />
         <aside className="sidebar">
           <Leaderboard players={players} gameState={state} />
-          <Chat socket={socket} room_id={room_id} />
+          <Chat variant="sidebar" messages={chatMessages} onSend={handleSendChat} />
         </aside>
 
         <main className="board">
@@ -283,10 +310,10 @@ export default function GameScreen({ gameState, mySid, socket }) {
               <div className="player-hand">
                 <AnimatePresence mode="popLayout">
                   {hand.map((txt, idx) => (
-                    <Card 
+                    <Card
                       key={txt} // Usar solo el texto para que la key sea estable al desplazar índices
-                      text={txt} 
-                      type="white" 
+                      text={txt}
+                      type="white"
                       isPlayable={canPlay}
                       isSelected={selectedCards.includes(idx)}
                       selectionOrder={selectedCards.indexOf(idx) !== -1 ? selectedCards.indexOf(idx) + 1 : null}
@@ -299,6 +326,15 @@ export default function GameScreen({ gameState, mySid, socket }) {
           )}
         </main>
       </div>
+
+      {/* Mobile chat drawer (opened from the banner FAB) */}
+      <Chat
+        variant="drawer"
+        messages={chatMessages}
+        open={chatOpen}
+        onClose={() => setChatOpen(false)}
+        onSend={handleSendChat}
+      />
 
       {showCustomModal && (
         <div style={{

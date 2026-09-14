@@ -23,6 +23,11 @@ export default function Card({
   const cardRef = useRef(null)
   const textRef = useRef(null)
 
+  // Hover lift only for devices with a real hover pointer. On touch, animating
+  // the card between pointerdown and pointerup moves it out from under the
+  // finger, so the browser retargets/cancels the click and the tap is lost.
+  const canHover = typeof window !== 'undefined' && window.matchMedia?.('(hover: hover) and (pointer: fine)').matches
+
   useLayoutEffect(() => {
     const textEl = textRef.current
     const cardEl = cardRef.current
@@ -90,7 +95,7 @@ export default function Card({
       initial={{ scale: 0.8, opacity: 0, y: 20 }}
       animate={{ scale: 1, opacity: 1, y: 0 }}
       exit={{ scale: 0.8, opacity: 0 }}
-      whileHover={isPlayable ? { y: -10, scale: 1.05 } : {}}
+      whileHover={isPlayable && canHover ? { y: -10, scale: 1.05 } : undefined}
       transition={{ type: 'spring', stiffness: 300, damping: 20 }}
       layout
     >
