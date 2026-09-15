@@ -26,4 +26,9 @@ EXPOSE 3000
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "app.py"]
+# Servidor de producción: Gunicorn con worker 'gthread' (hilos) que empareja con
+# async_mode='threading' de app.py; simple-websocket da soporte de WebSocket.
+# Un solo proceso worker es obligatorio con Flask-SocketIO (el estado de partida
+# vive en memoria); la concurrencia se logra con los hilos. --timeout cubre las
+# conexiones WebSocket largas del polling/WebSocket de Socket.IO.
+CMD ["gunicorn", "-k", "gthread", "-w", "1", "--threads", "100", "--timeout", "120", "--graceful-timeout", "30", "--bind", "0.0.0.0:3000", "app:app"]

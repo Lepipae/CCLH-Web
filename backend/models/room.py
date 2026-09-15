@@ -1,3 +1,4 @@
+import time
 import random
 from models.player import Player
 
@@ -27,6 +28,10 @@ class Room:
         self.last_winning_card = None
         self.last_winner_name = None
 
+        # Momento (time.time()) en el que la sala se quedó sin jugadores conectados.
+        # None mientras haya alguien conectado; lo usa el reaper para limpiar salas vacías.
+        self.empty_since = None
+
     def add_player(self, player):
         self.players[player.sid] = player
         if player.sid not in self.join_order:
@@ -38,7 +43,9 @@ class Room:
             self.renew_votes.discard(sid)
 
     def get_active_players(self):
-        return [p for p in self.players.values() if p.is_connected]
+        active = [p for p in self.players.values() if p.is_connected]
+        self.empty_since = None if active else (self.empty_since or time.time())
+        return active
 
     def deal_cards(self, count):
         if len(self.available_whites) < count:

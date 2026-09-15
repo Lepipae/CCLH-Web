@@ -20,7 +20,7 @@ Juego web multijugador de tipo *Cards Against Humanity*: un jugador actúa como 
 | --- | --- |
 | Frontend | React 19, Vite, framer-motion, lucide-react |
 | Comunicación | Socket.IO (eventos en tiempo real bidireccionales) |
-| Backend | Python 3.11, Flask, Flask-SocketIO, eventlet |
+| Backend | Python 3.11, Flask, Flask-SocketIO (modo threading + simple-websocket), Gunicorn |
 | Contenedor | Docker multi-stage (node:20-alpine para el build, python:3.11-slim para servir) |
 | Túnel público | ngrok (contenedor sidecar) |
 | Scraper de cartas | requests, BeautifulSoup, deep-translator (opcional, solo para regenerar el mazo) |
@@ -105,9 +105,16 @@ cd ..
 cd backend
 pip install -r requirements.txt
 python app.py
+
+# Alternativa producción (igual que el contenedor):
+gunicorn -k gthread -w 1 --threads 100 --timeout 120 --bind 0.0.0.0:3000 app:app
 ```
 
 La aplicación quedará disponible en `http://localhost:3000`. Existe también `start.sh`, que automatiza estos pasos y arranca ngrok si está instalado localmente.
+
+### Modelo de concurrencia
+
+El servidor usa Flask-SocketIO en `async_mode='threading'` con `simple-websocket` (sin eventlet ni gevent, ambos en desuso y problemáticos en Python moderno). En producción Gunicorn arranca un único worker `gthread` con 100 hilos: un solo proceso es obligatorio porque el estado de las partidas vive en memoria. Todas las operaciones del juego se serializan con un `RLock` en `GameManager`, y un tarea periódica elimina las salas que llevan un tiempo sin jugadores conectados.
 
 Para desarrollar el frontend con recarga en caliente (`npm run dev` en Vite) es necesario que el backend esté accesible desde el puerto del servidor de desarrollo; la configuración actual conecta Socket.IO contra el mismo origen, por lo que la vía simple es desarrollar contra el build compilado o añadir un proxy en `vite.config.js`.
 
@@ -125,6 +132,17 @@ Las configura el líder antes de iniciar la partida:
 
 - **Taller de cartas**: accesible desde la pantalla inicial. Permite crear cartas blancas y negras que se guardan de forma persistente en `cartasCustom.json` y están disponibles en todas las salas y partidas. Las cartas se validan contra el mazo existente para evitar duplicados prácticamente idénticos.
 - **Importar y exportar el mazo**: el taller admite subir un archivo `.json` con el mismo formato que los sets base (`whiteCards` como texto, `blackCards` como `{text, pick}`). El archivo se valida carta a carta en cliente y servidor: las inválidas y duplicadas se omiten individualmente y el resto se incorpora al mazo global y a las salas activas al instante. El botón «Exportar mazo» descarga el mazo personalizado completo como `cartasCustom.json`, listo para compartir o volver a importar en otra instancia.
+
+## Tests
+
+El backend incluye una suite de pytest (en `backend/tests/`) que cubre la importación/exportación de cartas y el alta/baja individual, usando el cliente de pruebas en proceso de Flask-SocketIO (sin abrir puertos) y rutas de datos aisladas en temporales, de modo que nunca toca el `cartasCustom.json` real:
+
+```bash
+pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+python3 -m pytest backend/tests -q
+```
+
+Las rutas de `cartasCustom.json` (interna y externa) son sobrescribibles con las variables de entorno `INTERNAL_CUSTOM_PATH` y `EXTERNAL_CARDS_DIR`, lo que permite arrancar instancias de prueba con datos separados.
 - **Cartas por sala**: durante la sala de espera, cualquier jugador puede añadir cartas blancas temporales separadas por comas. Solo viven en esa sala y no se guardan en el mazo global.
 - El archivo `cartasCustom.json` se sincroniza automáticamente entre el directorio interno del backend y la carpeta `custom_cards/` del host, de modo que las cartas creadas desde la web sobreviven a reconstrucciones del contenedor.
 

@@ -1,0 +1,2 @@
+# Dependencias para desarrollar y probar el backend (instalar además de requirements.txt)
+pytest>=8.0.0

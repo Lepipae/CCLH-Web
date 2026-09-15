@@ -7,8 +7,9 @@ from models.game_manager import GameManager
 # Configurar Flask para servir archivos estáticos del frontend de React
 app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
 app.config['SECRET_KEY'] = 'secreto_super_seguro'
-# Permitimos CORS a Vite
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Permitimos CORS a Vite. async_mode='threading' usa el servidor de Flask/Werkzeug
+# con simple-websocket para soporte de WebSocket (sin eventlet ni gevent).
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 CARTAS_BLANCAS = []
 CARTAS_NEGRAS = []
@@ -42,7 +43,9 @@ def cargar_cartas():
         print("Error cargando cartas base:", e)
 
     # Cargar y sincronizar cartasCustom.json con la carpeta externa
-    internal_custom_path = os.path.join(base_dir, "DataScraping", "cartasCustom.json")
+    # (la ruta interna es sobrescribible por entorno para los tests)
+    env_int_path = os.environ.get("INTERNAL_CUSTOM_PATH")
+    internal_custom_path = os.path.abspath(env_int_path) if env_int_path else os.path.join(base_dir, "DataScraping", "cartasCustom.json")
     env_ext_dir = os.environ.get("EXTERNAL_CARDS_DIR")
     if env_ext_dir:
         ext_dir = os.path.abspath(env_ext_dir)
@@ -206,4 +209,6 @@ def on_send_chat(data):
     manager.send_chat(request.sid, data.get('room_id', '').upper(), data.get('msg', ''))
 
 if __name__ == '__main__':
+    # Servidor embebido (Werkzeug) solo para desarrollo local.
+    # En producción (Docker) se arranca con Gunicorn en modo hilos: ver Dockerfile.
     socketio.run(app, host='0.0.0.0', port=3000, debug=False, allow_unsafe_werkzeug=True)

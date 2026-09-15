@@ -1,4 +1,6 @@
 import random
+import threading
+import time
 import uuid
 import json
 import difflib
@@ -6,13 +8,27 @@ from models.room import Room
 from models.player import Player
 
 class GameManager:
+    # Reaper: borra salas sin jugadores conectados tras este tiempo (segundos)
+    ROOM_TTL_EMPTY = 60
+    # Intervalo de escaneo del reaper en segundo plano (segundos)
+    ROOM_REAP_INTERVAL = 15
+
     def __init__(self, socketio, white_cards, black_cards):
         self.rooms = {}
         self.socketio = socketio
         self.global_white_cards = white_cards
         self.global_black_cards = black_cards
+        # Bajo async_mode='threading' los handlers corren en hilos reales y pueden
+        # intercalarse a mitad de una mutación (reparto de cartas, cambio de estado,
+        # import al mazo global...). Este cerrojo serializa TODAS las operaciones
+        # del juego: granularidad gruesa a propósito, la partida es por turnos y el
+        # coste es despreciable frente a la E/S de red. RLock (no Lock) porque hay
+        # reentradas legítimas: choose_winner -> send_room_update, etc.
+        self._lock = threading.RLock()
+        self._start_room_reaper()
 
     def send_room_update(self, room_id):
+        # Se ejecuta dentro del cerrojo del llamador; solo lee estado
         if room_id in self.rooms:
             room = self.rooms[room_id]
             for sid, p in room.players.items():
@@ -24,6 +40,10 @@ class GameManager:
         self.socketio.emit('chat_message', {'msg': message, 'system': True}, to=room_id)
 
     def join_game(self, sid, name, room_id):
+        with self._lock:
+            return self._join_game_locked(sid, name, room_id)
+
+    def _join_game_locked(self, sid, name, room_id):
         if room_id in self.rooms:
             # Check duplicates
             for existing_sid, p in self.rooms[room_id].players.items():
@@ -35,6 +55,7 @@ class GameManager:
             self.rooms[room_id] = Room(room_id, sid, self.global_white_cards, self.global_black_cards)
 
         room = self.rooms[room_id]
+        room.empty_since = None
 
         reconnected = False
         for existing_sid, p in list(room.players.items()):
@@ -71,6 +92,10 @@ class GameManager:
         return True
 
     def disconnect(self, sid):
+        with self._lock:
+            self._disconnect_locked(sid)
+
+    def _disconnect_locked(self, sid):
         for room_id, room in self.rooms.items():
             if sid in room.players:
                 room.remove_player(sid)
@@ -85,8 +110,49 @@ class GameManager:
                             random.shuffle(room.played_cards)
                     self.check_and_execute_renew(room)
                     self.send_room_update(room_id)
+                else:
+                    # Sala vacía: se marca el momento y el reaper la borrará si nadie vuelve
+                    room.empty_since = time.time()
+
+    def _start_room_reaper(self):
+        """Lanza la tarea en segundo plano que limpia periódicamente las salas vacías."""
+        self.socketio.start_background_task(self._room_reaper_loop)
+
+    def _room_reaper_loop(self):
+        while True:
+            try:
+                self.reap_empty_rooms()
+            except Exception as e:
+                print("Error en el reaper de salas:", e)
+            self.socketio.sleep(self.ROOM_REAP_INTERVAL)
+
+    def reap_empty_rooms(self):
+        """Elimina las salas que llevan más de ROOM_TTL_EMPTY sin jugadores conectados."""
+        with self._lock:
+            now = time.time()
+            expired = [rid for rid, room in self.rooms.items()
+                       if room.empty_since is not None and now - room.empty_since >= self.ROOM_TTL_EMPTY]
+            for room_id in expired:
+                self._delete_room(room_id)
+        if expired:
+            print(f"Reaper: {len(expired)} sala(s) vacía(s) eliminada(s): {', '.join(expired)}")
+
+    def _delete_room(self, room_id):
+        room = self.rooms.pop(room_id, None)
+        if not room:
+            return
+        room.players.clear()
+        room.played_cards = []
+        room.available_whites = []
+        room.available_blacks = []
+        room.renew_votes.clear()
+        room.join_order = []
 
     def start_game(self, sid, room_id):
+        with self._lock:
+            self._start_game_locked(sid, room_id)
+
+    def _start_game_locked(self, sid, room_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state == 'waiting' and room.leader == sid:
@@ -121,6 +187,10 @@ class GameManager:
                 self.send_room_update(room_id)
 
     def update_options(self, sid, room_id, data):
+        with self._lock:
+            self._update_options_locked(sid, room_id, data)
+
+    def _update_options_locked(self, sid, room_id, data):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state == 'waiting' and room.leader == sid:
@@ -145,6 +215,10 @@ class GameManager:
                 self.send_room_update(room_id)
 
     def play_card(self, sid, room_id, card_index):
+        with self._lock:
+            self._play_card_locked(sid, room_id, card_index)
+
+    def _play_card_locked(self, sid, room_id, card_index):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state == 'playing' and sid != room.czar and sid in room.players:
@@ -176,6 +250,10 @@ class GameManager:
                     self.send_room_update(room_id)
 
     def reveal_card(self, sid, room_id, sub_id):
+        with self._lock:
+            self._reveal_card_locked(sid, room_id, sub_id)
+
+    def _reveal_card_locked(self, sid, room_id, sub_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state == 'judging' and sid == room.czar:
@@ -186,6 +264,10 @@ class GameManager:
                 self.send_room_update(room_id)
 
     def choose_winner(self, sid, room_id, sub_id):
+        with self._lock:
+            self._choose_winner_locked(sid, room_id, sub_id)
+
+    def _choose_winner_locked(self, sid, room_id, sub_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state == 'judging' and sid == room.czar:
@@ -206,19 +288,26 @@ class GameManager:
                     self.socketio.start_background_task(self.auto_next_round, room_id, sid)
 
     def auto_next_round(self, room_id, old_czar_sid):
+        # Tarea en segundo plano: también debe respetar el cerrojo
         self.socketio.sleep(5)
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'round_end' and room.czar == old_czar_sid:
+        with self._lock:
+            room = self.rooms.get(room_id)
+            if room and room.state == 'round_end' and room.czar == old_czar_sid:
                 self.advance_to_next_round(room_id)
 
     def force_next_round(self, sid, room_id):
+        with self._lock:
+            self._force_next_round_locked(sid, room_id)
+
+    def _force_next_round_locked(self, sid, room_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state == 'round_end' and room.czar == sid:
                 self.advance_to_next_round(room_id)
 
     def advance_to_next_round(self, room_id):
+        # Público porque lo invocan auto_next_round y _force_next_round_locked;
+        # ambos ya llegan dentro del cerrojo
         if room_id in self.rooms:
             room = self.rooms[room_id]
             
@@ -261,6 +350,10 @@ class GameManager:
             self.send_room_update(room_id)
 
     def vote_card(self, sid, room_id, card_id):
+        with self._lock:
+            self._vote_card_locked(sid, room_id, card_id)
+
+    def _vote_card_locked(self, sid, room_id, card_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state in ['judging', 'round_end'] and sid != room.czar and sid in room.players:
@@ -292,6 +385,10 @@ class GameManager:
                 self.send_room_update(room_id)
 
     def vote_renew(self, sid, room_id):
+        with self._lock:
+            self._vote_renew_locked(sid, room_id)
+
+    def _vote_renew_locked(self, sid, room_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if sid in room.players and room.players[sid].is_connected:
@@ -332,6 +429,10 @@ class GameManager:
                 self.send_chat_system(room.room_id, '¡Se han renovado las cartas de todos los jugadores!')
 
     def change_black_card(self, sid, room_id):
+        with self._lock:
+            self._change_black_card_locked(sid, room_id)
+
+    def _change_black_card_locked(self, sid, room_id):
         if room_id in self.rooms:
             room = self.rooms[room_id]
             if room.state == 'playing' and room.czar == sid:
@@ -357,6 +458,10 @@ class GameManager:
 
     def _get_custom_file_path(self):
         import os
+        # Sobrescribible por entorno: los tests la aíslan para no tocar datos reales
+        env_path = os.environ.get("INTERNAL_CUSTOM_PATH")
+        if env_path:
+            return os.path.abspath(env_path)
         base_dir = os.path.dirname(os.path.abspath(__file__))
         return os.path.abspath(os.path.join(base_dir, "..", "DataScraping", "cartasCustom.json"))
 
@@ -385,6 +490,11 @@ class GameManager:
             print("Error exportando cartas a carpeta externa:", e)
 
     def add_custom_card(self, card_type, text, pick, respond_cb):
+        # Cerrojo alrededor de todo: muta el mazo global, el archivo y las salas
+        with self._lock:
+            self._add_custom_card_locked(card_type, text, pick, respond_cb)
+
+    def _add_custom_card_locked(self, card_type, text, pick, respond_cb):
         import os
         text = text.strip()
         if not text:
@@ -467,6 +577,10 @@ class GameManager:
         respond_cb({'success': True, 'whiteCards': [], 'blackCards': []})
 
     def delete_custom_card(self, card_type, text, respond_cb):
+        with self._lock:
+            self._delete_custom_card_locked(card_type, text, respond_cb)
+
+    def _delete_custom_card_locked(self, card_type, text, respond_cb):
         import os
         custom_path = self._get_custom_file_path()
         external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
@@ -517,6 +631,10 @@ class GameManager:
         se descartan individualmente; el resto se guarda y se inyecta en el
         mazo global y en las salas activas, igual que add_custom_card.
         """
+        with self._lock:
+            self._import_custom_cards_locked(raw_json, respond_cb)
+
+    def _import_custom_cards_locked(self, raw_json, respond_cb):
         import os
 
         MAX_TEXT_LEN = 200   # longitud máxima por carta
@@ -690,16 +808,18 @@ class GameManager:
                     'blackCards': custom_data.get('blackCards', [])})
 
     def add_room_cards(self, room_id, cards_str):
-        if room_id in self.rooms:
-            new_cards = [c.strip() for c in cards_str.split(',') if c.strip()]
-            if new_cards:
-                self.rooms[room_id].available_whites.extend(new_cards)
-                random.shuffle(self.rooms[room_id].available_whites)
-                self.send_chat_system(room_id, f'Se han añadido {len(new_cards)} cartas personalizadas a la sala.')
+        with self._lock:
+            room = self.rooms.get(room_id)
+            if room:
+                new_cards = [c.strip() for c in cards_str.split(',') if c.strip()]
+                if new_cards:
+                    room.available_whites.extend(new_cards)
+                    random.shuffle(room.available_whites)
+                    self.send_chat_system(room_id, f'Se han añadido {len(new_cards)} cartas personalizadas a la sala.')
 
     def send_chat(self, sid, room_id, msg):
-        if room_id in self.rooms and msg:
-            room = self.rooms[room_id]
-            if sid in room.players:
+        with self._lock:
+            room = self.rooms.get(room_id)
+            if room and msg and sid in room.players:
                 pname = room.players[sid].name
                 self.socketio.emit('chat_message', {'msg': msg, 'sender': pname, 'system': False}, to=room_id)
