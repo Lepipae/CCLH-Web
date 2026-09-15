@@ -124,6 +124,7 @@ Las configura el líder antes de iniciar la partida:
 ## Cartas personalizadas
 
 - **Taller de cartas**: accesible desde la pantalla inicial. Permite crear cartas blancas y negras que se guardan de forma persistente en `cartasCustom.json` y están disponibles en todas las salas y partidas. Las cartas se validan contra el mazo existente para evitar duplicados prácticamente idénticos.
+- **Importar y exportar el mazo**: el taller admite subir un archivo `.json` con el mismo formato que los sets base (`whiteCards` como texto, `blackCards` como `{text, pick}`). El archivo se valida carta a carta en cliente y servidor: las inválidas y duplicadas se omiten individualmente y el resto se incorpora al mazo global y a las salas activas al instante. El botón «Exportar mazo» descarga el mazo personalizado completo como `cartasCustom.json`, listo para compartir o volver a importar en otra instancia.
 - **Cartas por sala**: durante la sala de espera, cualquier jugador puede añadir cartas blancas temporales separadas por comas. Solo viven en esa sala y no se guardan en el mazo global.
 - El archivo `cartasCustom.json` se sincroniza automáticamente entre el directorio interno del backend y la carpeta `custom_cards/` del host, de modo que las cartas creadas desde la web sobreviven a reconstrucciones del contenedor.
 

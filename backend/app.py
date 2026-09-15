@@ -190,6 +190,13 @@ def on_delete_custom_card(data):
         emit('custom_card_deleted', res)
     manager.delete_custom_card(data.get('type'), data.get('text', ''), respond_cb)
 
+@socketio.on('import_custom_cards')
+def on_import_custom_cards(data):
+    # El cliente envía el contenido del archivo .json ya parseado (objeto) o como texto crudo
+    def respond_cb(res):
+        emit('custom_cards_imported', res)
+    manager.import_custom_cards(data.get('json'), respond_cb)
+
 @socketio.on('add_room_cards')
 def on_add_room_cards(data):
     manager.add_room_cards(data.get('room_id', '').upper(), data.get('cards', ''))
