@@ -1,9 +1,11 @@
-"""Edge cases de desconexión: liderazgo, juez y rotación.
+"""Edge cases de desconexión: liderazgo, juez, rotación y conservación del mazo.
 
 Comprueba que al marcharse el líder o el juez la sala nunca queda congelada:
 el relevo siempre recae en un jugador conectado, la rotación secuencial no se
 reinicia, un ganador desconectado no bloquea el avance y una sala "huérfana"
-se autoasana cuando vuelve a entrar alguien.
+se autoasana cuando vuelve a entrar alguien. También verifica la invariante
+de cartas: un inicio fallido no toca manos ni pool, y el descarte de
+submissiones huérfanas devuelve todas las blancas jugadas a `available_whites`.
 """
 import pytest
 
@@ -47,8 +49,9 @@ def room_clients(app_module, manager):
 def start_seq_game(app_module, room_clients, room_id, names):
     """Une `names` (el primero es líder), fija turn_order='sequential' y arranca.
 
-    Devuelve (clientes, sids, room). Con sequential el czar inicial es el
-    primero que entró, así los tests son deterministas.
+    Devuelve (sids, room). Con sequential el czar inicial es el primero que
+    entró, así los tests son deterministas. Solo se devuelve el cliente cuando
+    algún test necesita emitir eventos adicionales.
     """
     clients, sids = {}, {}
     for name in names:
@@ -57,11 +60,16 @@ def start_seq_game(app_module, room_clients, room_id, names):
     room.options["turn_order"] = "sequential"
     clients[names[0]].emit("start_game", {"room_id": room_id})
     clients[names[0]].get_received()
-    return clients, sids, room
+    return sids, room
 
 
 def sub_of(room, sid):
-    """Submission (entrada de played_cards) del jugador sid."""
+    """Submission (entrada de played_cards) del jugador sid.
+
+    Invariante: el czar nunca tiene submission propia en juego; si se pide la
+    del czar es un error del test, no un caso límite del juego.
+    """
+    assert sid != room.czar, "el czar no juega cartas: no puede tener submission"
     for c in room.played_cards:
         if c["sid"] == sid:
             return c
@@ -70,21 +78,23 @@ def sub_of(room, sid):
 
 class TestLeaderHandoff:
     def test_waiting_room_leader_promotes_a_connected_player(self, app_module, room_clients):
-        _, alice = room_clients("Alice", "LW1")
-        _, bob = room_clients("Bob", "LW1")
-        _, carol = room_clients("Carol", "LW1")
+        room_clients("Alice", "LW1")
+        room_clients("Bob", "LW1")
+        room_clients("Carol", "LW1")
         room = app_module.manager.rooms["LW1"]
+        alice = sid_of(room, "Alice")
         assert room.leader == alice
 
         app_module.manager.disconnect(alice)
 
-        assert room.leader in (bob, carol)
+        assert room.leader != alice
+        assert room.leader in (sid_of(room, "Bob"), sid_of(room, "Carol"))
         assert room.players[room.leader].is_connected
 
     def test_leader_handoff_skips_spectators_after_reorder(self, app_module, room_clients):
         """Bob reconecta y pasa al final del diccionario de jugadores; aunque una
         espectadora le preceda en el orden, el liderazgo debe recaer en él."""
-        clients, sids, room = start_seq_game(app_module, room_clients, "LW2", ["Alice", "Bob"])
+        sids, room = start_seq_game(app_module, room_clients, "LW2", ["Alice", "Bob"])
         room_clients("Dave", "LW2")  # entra con la partida en marcha: espectadora
         m = app_module.manager
 
@@ -98,7 +108,7 @@ class TestLeaderHandoff:
     def test_leader_falls_back_to_spectator_when_only_they_remain(self, app_module, room_clients):
         """Si al marcharse el líder solo quedan espectadoras, entran al juego y
         una de ellas hereda liderazgo y turno de juez: la partida continúa."""
-        clients, sids, room = start_seq_game(app_module, room_clients, "LW3", ["Alice", "Bob"])
+        sids, room = start_seq_game(app_module, room_clients, "LW3", ["Alice", "Bob"])
         room_clients("Carol", "LW3")
         room_clients("Dave", "LW3")
         m = app_module.manager
@@ -119,7 +129,7 @@ class TestLeaderHandoff:
 
 class TestCzarHandoff:
     def test_czar_disconnect_mid_judging_passes_to_a_player(self, app_module, room_clients):
-        clients, sids, room = start_seq_game(app_module, room_clients, "CJ1", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "CJ1", ["Alice", "Bob", "Carol"])
         m = app_module.manager
         m.play_card(sids["Bob"], "CJ1", 0)
         m.play_card(sids["Carol"], "CJ1", 0)
@@ -138,7 +148,7 @@ class TestCzarHandoff:
         assert room.state == "round_end"
 
     def test_czar_disconnect_mid_playing_keeps_round_alive(self, app_module, room_clients):
-        clients, sids, room = start_seq_game(app_module, room_clients, "CJ2", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "CJ2", ["Alice", "Bob", "Carol"])
         m = app_module.manager
         m.play_card(sids["Bob"], "CJ2", 0)
         assert room.state == "playing"
@@ -158,7 +168,7 @@ class TestCzarHandoff:
     def test_sequential_rotation_continues_from_departed_czar(self, app_module, room_clients):
         """Al rotar con sequential, el turno sigue desde la posición del juez
         ausente (Carol) en vez de reiniciarse en el primero de la lista."""
-        clients, sids, room = start_seq_game(app_module, room_clients, "CJ3", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "CJ3", ["Alice", "Bob", "Carol"])
         m = app_module.manager
         m.disconnect(sids["Alice"])  # alice era czar y líder
 
@@ -177,7 +187,7 @@ class TestCzarHandoff:
         """Si el juez se va y ningún jugador conectado conserva carta jugada, el
         recuento huérfano se descarta (cartas devueltas al mazo), las
         espectadoras entran al juego y la ronda vuelve a 'playing'."""
-        clients, sids, room = start_seq_game(app_module, room_clients, "CJ4", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "CJ4", ["Alice", "Bob", "Carol"])
         m = app_module.manager
         m.play_card(sids["Bob"], "CJ4", 0)
         m.play_card(sids["Carol"], "CJ4", 0)
@@ -202,10 +212,67 @@ class TestCzarHandoff:
         assert room.czar == dave
         assert room.players[dave].waiting_next_round is False
 
+    def test_discarded_submissions_return_all_played_cards_to_available_whites(self, app_module, room_clients):
+        """Invariante de conservación del mazo: al descartarse la ronda por la
+        marcha del juez, TODAS las blancas jugadas (las de cada submission
+        huérfana) vuelven al pool `available_whites` antes de reabrir 'playing'.
+
+        Se usa una negra pick=2 para forzar submissions de DOS cartas y así
+        verificar que se devuelven todas las cartas jugadas, no solo una por
+        jugador. Las espectadoras mantienen la sala con el mínimo de conectados
+        para que el descarte lo dispare el relevo del juez y no el revert.
+        """
+        sids, room = start_seq_game(app_module, room_clients, "CJ5", ["Alice", "Bob", "Carol"])
+        m = app_module.manager
+
+        # Negra pick=2: cada submission lleva DOS cartas blancas
+        two_pick = next(c for c in room.available_blacks if isinstance(c, dict) and c.get("pick") == 2)
+        room.available_blacks.remove(two_pick)
+        room.black_card = two_pick
+
+        # Manos completas ANTES de jugar: las cartas [0, 1] salen en orden de selección
+        hand_bob_full = list(room.players[sids["Bob"]].hand)
+        hand_carol_full = list(room.players[sids["Carol"]].hand)
+
+        m.play_card(sids["Bob"], "CJ5", [0, 1])
+        m.play_card(sids["Carol"], "CJ5", [0, 1])
+        assert room.state == "judging"
+
+        # Instantáneas justo antes del descarte: cada submission lleva las 2
+        # primeras cartas de la mano original (pick=2)
+        played_bob = list(sub_of(room, sids["Bob"])["cards"])
+        played_carol = list(sub_of(room, sids["Carol"])["cards"])
+        assert played_bob == hand_bob_full[:2]
+        assert played_carol == hand_carol_full[:2]
+        room_clients("Dave", "CJ5")   # espectadoras de respaldo: mantienen el
+        room_clients("Eve", "CJ5")    # quórum para que no salte el revert a waiting
+        pool_at_judging = len(room.available_whites)  # tras la entrada de las espectadoras
+
+        # Se marchan los que jugaron y después la jueza: sin conectados con
+        # carta jugada, el recuento huérfano se descarta íntegro
+        m.disconnect(sids["Bob"])
+        m.disconnect(sids["Carol"])
+        assert room.state == "judging"  # la jueza sigue: la ronda no se toca
+        m.disconnect(sids["Alice"])
+
+        assert room.state == "playing"
+        assert room.played_cards == []
+        # Las 4 cartas jugadas (2 por submission) están de vuelta en el pool
+        assert len(room.available_whites) == pool_at_judging + 4
+        assert set(played_bob) | set(played_carol) <= set(room.available_whites)
+        # Cada jugador conserva íntegro el resto de su mano (el descarte no la toca)
+        assert room.players[sids["Bob"]].hand == hand_bob_full[2:]
+        assert room.players[sids["Carol"]].hand == hand_carol_full[2:]
+        assert room.players[sids["Bob"]].played_card is None
+        assert room.players[sids["Carol"]].played_card is None
+        dave = sid_of(room, "Dave")
+        assert room.czar == dave
+        assert room.players[dave].waiting_next_round is False
+
 
 class TestWinnerRotation:
     def test_choose_winner_rejects_disconnected_submission(self, app_module, room_clients):
-        clients, sids, room = start_seq_game(app_module, room_clients, "W1", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "W1", ["Alice", "Bob", "Carol"])
         m = app_module.manager
         m.play_card(sids["Bob"], "W1", 0)
         m.play_card(sids["Carol"], "W1", 0)
@@ -224,7 +291,7 @@ class TestWinnerRotation:
         assert room.players[sids["Carol"]].points == 1
 
     def test_round_advances_when_winner_left_during_round_end(self, app_module, room_clients):
-        clients, sids, room = start_seq_game(app_module, room_clients, "W2", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "W2", ["Alice", "Bob", "Carol"])
         room.options["turn_order"] = "winner"  # el ganador pasa a juez: el caso que se congelaba
         m = app_module.manager
         m.play_card(sids["Bob"], "W2", 0)
@@ -243,19 +310,19 @@ class TestWinnerRotation:
 
 class TestHealOnJoin:
     def test_join_heals_stale_leader(self, app_module, room_clients):
-        _, alice = room_clients("Alice", "H1")
-        _, bob = room_clients("Bob", "H1")
+        room_clients("Alice", "H1")
+        room_clients("Bob", "H1")
         room_clients("Carol", "H1")
         room = app_module.manager.rooms["H1"]
-        room.players[alice].is_connected = False  # desconexión perdida (simulada)
+        room.players[sid_of(room, "Alice")].is_connected = False  # desconexión perdida (simulada)
 
         room_clients("Dave", "H1")  # cualquiera que entre autoasana la sala
 
-        assert room.leader == bob
+        assert room.leader == sid_of(room, "Bob")
         assert room.players[room.leader].is_connected
 
     def test_join_heals_stale_czar_mid_round(self, app_module, room_clients):
-        clients, sids, room = start_seq_game(app_module, room_clients, "H2", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "H2", ["Alice", "Bob", "Carol"])
         assert room.czar == sids["Alice"]
         room.players[sids["Alice"]].is_connected = False  # desconexión perdida
 
@@ -266,7 +333,7 @@ class TestHealOnJoin:
         assert room.leader == sids["Bob"]  # el liderazgo también se reasigna
 
     def test_join_heals_round_end_stuck_without_czar(self, app_module, room_clients):
-        clients, sids, room = start_seq_game(app_module, room_clients, "H3", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "H3", ["Alice", "Bob", "Carol"])
         m = app_module.manager
         m.play_card(sids["Bob"], "H3", 0)
         m.play_card(sids["Carol"], "H3", 0)
@@ -285,28 +352,48 @@ class TestHealOnJoin:
 
 class TestStartGameGuard:
     def test_start_game_needs_two_players(self, app_module, room_clients):
-        c_a, _ = room_clients("Alice", "S1")
+        """Con un solo jugador, start_game no arranca nada: el estado de la sala
+        se conserva intacto, la mano sigue vacía (has_played nunca se activa) y
+        el pool de blancas no sufre ninguna merma ni por repartir ni por devolver."""
+        c_a, alice_sid = room_clients("Alice", "S1")
         room = app_module.manager.rooms["S1"]
+        player = room.players[alice_sid]
+        assert len(player.hand) == 0  # sin partida, la mano arranca vacía
+        hand_before = len(player.hand)
+        pool_before = len(room.available_whites)
+        c_a.get_received()  # drenar el game_update de su propia entrada
 
         c_a.emit("start_game", {"room_id": "S1"})
-        c_a.get_received()
+        # El guard rechaza en silencio: no emite ningún evento al cliente
+        assert c_a.get_received() == []
+
+        assert room.state == "waiting"
+        assert room.czar is None
+        assert room.black_card is None
+        # La mano del jugador permanece vacía: no se ha repartido ninguna carta
+        assert len(player.hand) == 0
+        assert len(player.hand) == hand_before
+        # has_played no se activa (played_card sigue a None)
+        assert player.played_card is None
+        assert player.to_dict()["has_played"] is False
+        # El pool available_whites no sufre ninguna merma
+        assert len(room.available_whites) == pool_before
+
+    def test_non_leader_cannot_start(self, app_module, room_clients):
+        room_clients("Alice", "S3")
+        c_b, _ = room_clients("Bob", "S3")
+        room = app_module.manager.rooms["S3"]
+        c_b.get_received()  # drenar el game_update de su propia entrada
+
+        c_b.emit("start_game", {"room_id": "S3"})
+        assert c_b.get_received() == []  # un no-líder no provoca ni siquiera error: no pasa nada
 
         assert room.state == "waiting"
         assert room.czar is None
         assert room.black_card is None
 
-    def test_non_leader_cannot_start(self, app_module, room_clients):
-        _, alice = room_clients("Alice", "S3")
-        c_b, _ = room_clients("Bob", "S3")
-        room = app_module.manager.rooms["S3"]
-
-        c_b.emit("start_game", {"room_id": "S3"})
-        c_b.get_received()
-
-        assert room.state == "waiting"
-
     def test_start_game_starts_with_two(self, app_module, room_clients):
-        _, sids, room = start_seq_game(app_module, room_clients, "S2", ["Alice", "Bob"])
+        sids, room = start_seq_game(app_module, room_clients, "S2", ["Alice", "Bob"])
 
         assert room.state == "playing"
         assert room.czar == sids["Alice"]
@@ -317,7 +404,7 @@ class TestReconnection:
     def test_rejoin_recovers_seat_and_keeps_playing(self, app_module, room_clients):
         """Al reconectar con el mismo nombre se recupera la plaza completa:
         conexión, mano y participación activa en la partida."""
-        clients, sids, room = start_seq_game(app_module, room_clients, "R1", ["Alice", "Bob", "Carol"])
+        sids, room = start_seq_game(app_module, room_clients, "R1", ["Alice", "Bob", "Carol"])
         m = app_module.manager
 
         m.disconnect(sids["Bob"])
