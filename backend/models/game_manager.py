@@ -87,9 +87,32 @@ class GameManager:
             new_player = Player(sid, name, initial_hand=initial_hand, is_spectator=is_playing)
             room.add_player(new_player)
 
+        self._heal_stale_roles(room)
+
         print(f"{name} se unió a {room_id}")
         self.send_room_update(room_id)
         return True
+
+    def _heal_stale_roles(self, room):
+        """Autosanado al entrar alguien a la sala: si el líder o el juez
+        registrados están desconectados (por ejemplo, un disconnect perdido),
+        se reasignan para que la sala no quede inoperante."""
+        active = room.get_active_players()
+        if not active:
+            return
+        leader_p = room.players.get(room.leader)
+        if leader_p is None or not leader_p.is_connected:
+            room.leader = self._pick_new_leader(room, active)
+        if room.state != 'waiting' and len([p for p in active if not p.waiting_next_round]) < 2:
+            self._revert_to_waiting(room)
+            return
+        self._activate_spectators_if_abandoned(room, active)
+        czar_p = room.players.get(room.czar)
+        if room.czar and (czar_p is None or not czar_p.is_connected):
+            if room.state == 'round_end':
+                self.advance_to_next_round(room.room_id)
+            else:
+                self._reassign_czar_after_disconnect(room)
 
     def disconnect(self, sid):
         with self._lock:
@@ -102,17 +125,125 @@ class GameManager:
                 active = room.get_active_players()
                 if active:
                     if room.leader == sid:
-                        room.leader = active[0].sid
-                    if room.state == 'playing':
-                        active_non_czars = [pl for pl in active if pl.sid != room.czar and not pl.waiting_next_round]
-                        if active_non_czars and all(pl.played_card is not None for pl in active_non_czars):
-                            room.state = 'judging'
-                            random.shuffle(room.played_cards)
-                    self.check_and_execute_renew(room)
+                        room.leader = self._pick_new_leader(room, active)
+                    if room.state != 'waiting' and len(active) < 2:
+                        # Con un solo jugador no puede seguir ninguna partida
+                        self._revert_to_waiting(room)
+                    else:
+                        # Si solo quedan espectadores, entran al juego para que continúe
+                        self._activate_spectators_if_abandoned(room, active)
+                        if room.czar == sid:
+                            # El juez se marcha: reasignar el turno para no congelar la ronda
+                            self._reassign_czar_after_disconnect(room)
+                        if room.state == 'playing':
+                            active_non_czars = [pl for pl in active if pl.sid != room.czar and not pl.waiting_next_round]
+                            if active_non_czars and all(pl.played_card is not None for pl in active_non_czars):
+                                room.state = 'judging'
+                                random.shuffle(room.played_cards)
+                        if room.state != 'waiting':
+                            self.check_and_execute_renew(room)
                     self.send_room_update(room_id)
                 else:
                     # Sala vacía: se marca el momento y el reaper la borrará si nadie vuelve
                     room.empty_since = time.time()
+
+    def _pick_new_leader(self, room, active):
+        """Nuevo líder al marcharse el actual: prefiere a un jugador conectado que
+        no sea espectador (puede iniciar la partida); si solo quedan espectadores,
+        el primero por orden de llegada. None si no queda nadie conectado."""
+        candidates = [p for p in active if not p.waiting_next_round]
+        if candidates:
+            return candidates[0].sid
+        return active[0].sid if active else None
+
+    def _reassign_czar_after_disconnect(self, room):
+        """El juez se ha desconectado: se pasa el turno a otro jugador conectado
+        según el estado de la ronda, para que la partida no se quede congelada."""
+        active = room.get_active_players()
+        if not active:
+            return
+        if room.state == 'judging':
+            played = [p for p in active if p.played_card is not None and not p.waiting_next_round]
+            if played:
+                # Quien ya jugó puede revelar y elegir ganador al instante.
+                # Caso degenerado asumido: si solo queda su propia carta en juego,
+                # podría premiarse a sí mismo; es preferible a congelar la sala.
+                room.czar = played[0].sid
+                return
+            # No queda ningún jugador conectado con carta jugada: se descarta el
+            # recuento huérfano y la ronda vuelve a 'playing'
+            for c in room.played_cards:
+                room.available_whites.extend(c.get('cards', []))
+            random.shuffle(room.available_whites)
+            room.played_cards = []
+            room.state = 'playing'
+            for p in room.players.values():
+                if not p.is_connected and p.played_card is not None:
+                    p.played_card = None  # podrán volver a jugar al reconectar
+        if room.state == 'round_end':
+            # El recuento ya está cerrado: se avanza la ronda directamente
+            # (el auto-avance pendiente quedará obsoleto: comprueba el czar antiguo)
+            self.advance_to_next_round(room.room_id)
+            return
+        self._rotate_czar_from(room, room.czar)
+
+    def _pick_connected_czar(self, room, preferred_sid):
+        """El czar preferido si sigue conectado; si no, el primero conectado por
+        orden de llegada. None si no queda nadie conectado."""
+        if preferred_sid and preferred_sid in room.players and room.players[preferred_sid].is_connected:
+            return preferred_sid
+        for jsid in room.join_order:
+            p = room.players.get(jsid)
+            if p is not None and p.is_connected:
+                return jsid
+        return None
+
+    def _rotate_czar_from(self, room, old_czar_sid):
+        """Siguiente juez según la opción turn_order, saltándose a los
+        desconectados. Nunca deja de czar a alguien que no esté conectado."""
+        active = room.get_active_players()
+        if not active:
+            return
+        turn_order = room.options['turn_order']
+        if turn_order == 'random':
+            room.czar = random.choice(active).sid
+            return
+        if turn_order == 'sequential':
+            connected_ordered = [s for s in room.join_order if s in room.players and room.players[s].is_connected]
+            if connected_ordered:
+                if old_czar_sid in connected_ordered:
+                    idx = connected_ordered.index(old_czar_sid)
+                    room.czar = connected_ordered[(idx + 1) % len(connected_ordered)]
+                else:
+                    room.czar = connected_ordered[0]
+                return
+        # 'winner' (o secuencial sin candidatos): el ganador anterior si sigue
+        # conectado; si no, el primero conectado
+        room.czar = self._pick_connected_czar(room, room.last_winner) or active[0].sid
+
+    def _activate_spectators_if_abandoned(self, room, active):
+        """Si en una partida en curso solo quedan espectadores conectados, pasan
+        a jugadores para que la sala no quede eternamente esperando cartas."""
+        if room.state in ('playing', 'judging') and active and all(p.waiting_next_round for p in active):
+            for p in active:
+                p.waiting_next_round = False
+                faltan = room.options['hand_size'] - len(p.hand)
+                if faltan > 0:
+                    p.hand.extend(room.deal_cards(faltan))
+
+    def _revert_to_waiting(self, room):
+        """Devuelve la sala a la pantalla de espera: con menos de dos jugadores
+        reales no puede haber partida en curso."""
+        room.state = 'waiting'
+        for c in room.played_cards:
+            room.available_whites.extend(c.get('cards', []))
+        random.shuffle(room.available_whites)
+        room.played_cards = []
+        room.renew_votes.clear()
+        room.czar = None
+        room.black_card = None
+        for p in room.players.values():
+            p.waiting_next_round = False
 
     def _start_room_reaper(self):
         """Lanza la tarea en segundo plano que limpia periódicamente las salas vacías."""
@@ -169,12 +300,14 @@ class GameManager:
                         if faltan > 0:
                             p.hand.extend(room.deal_cards(faltan))
                             
+                if len(active) < 2:
+                    # Sin jugadores suficientes no se inicia: no se tocan el czar,
+                    # la carta negra ni el estado de la sala
+                    return
+
                 turn_order = room.options['turn_order']
                 if turn_order == 'sequential':
-                    for jsid in room.join_order:
-                        if jsid in room.players and room.players[jsid].is_connected:
-                            room.czar = jsid
-                            break
+                    room.czar = self._pick_connected_czar(room, None) or active[0].sid
                 else:
                     room.czar = random.choice(active).sid
                     
@@ -278,6 +411,10 @@ class GameManager:
                         break
                         
                 if winner_sid and winner_sid in room.players:
+                    # No premiar a quien se ha desconectado durante la ronda:
+                    # last_winner apuntaría a un sid muerto y congelaría la rotación
+                    if not room.players[winner_sid].is_connected:
+                        return
                     room.players[winner_sid].points += 1
                     room.state = 'round_end'
                     room.last_winner = winner_sid
@@ -318,15 +455,16 @@ class GameManager:
                 if active_players:
                     room.czar = random.choice(active_players).sid
             elif turn_order == 'sequential':
-                connected_ordered = [s for s in room.join_order if s in room.players and room.players[s].is_connected]
-                if connected_ordered:
-                    if room.czar in connected_ordered:
-                        idx = connected_ordered.index(room.czar)
-                        room.czar = connected_ordered[(idx + 1) % len(connected_ordered)]
-                    else:
-                        room.czar = connected_ordered[0]
+                self._rotate_czar_from(room, room.czar)
             else: # winner
-                room.czar = room.last_winner if room.last_winner else room.czar
+                # El ganador anterior pudo desconectarse durante el recuento
+                lw = room.players.get(room.last_winner)
+                if lw is not None and lw.is_connected:
+                    room.czar = room.last_winner
+                elif room.czar and room.czar in room.players and room.players[room.czar].is_connected:
+                    pass  # el juez actual sigue conectado: sigue juzgando
+                else:
+                    self._rotate_czar_from(room, room.czar)
                 
             room.state = 'playing'
             room.played_cards = []
