@@ -1,3 +1,5 @@
+import time
+
 class Player:
     def __init__(self, sid, name, initial_hand=None, is_spectator=False):
         self.sid = sid
@@ -7,6 +9,10 @@ class Player:
         self.played_card = None
         self.is_connected = True
         self.waiting_next_round = is_spectator
+        # Última señal de vida (acción recibida o difusión entregada) según el
+        # reloj del servidor. Lo consume el reaper para detectar zombis:
+        # sockets half-open que nunca disparan el evento 'disconnect'.
+        self.last_seen = time.time()
 
     def to_dict(self):
         return {

@@ -32,6 +32,13 @@ class Room:
         # None mientras haya alguien conectado; lo usa el reaper para limpiar salas vacías.
         self.empty_since = None
 
+        # Snapshot del número de cartas blancas del mazo en el momento de crear
+        # la sala (también se incrementa al inyectar cartas custom en directo).
+        # El reaper lo usa como "total esperado" del invariante de conservación:
+        # manos + cartas jugadas + available_whites == deck_size. Una deriva
+        # distinta de cero delata cartas huérfanas (creadas o perdidas).
+        self.deck_size = len(self.available_whites)
+
     def add_player(self, player):
         self.players[player.sid] = player
         if player.sid not in self.join_order:

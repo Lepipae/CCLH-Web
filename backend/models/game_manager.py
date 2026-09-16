@@ -3,19 +3,35 @@ import threading
 import time
 import uuid
 import json
+import os
+import logging
 import difflib
 from models.room import Room
 from models.player import Player
+
+# Logger del módulo: WARNING explícito (en vez de print) para deriva de cartas
+# y depuración de zombis, integrable con la telemetría del despliegue.
+logger = logging.getLogger(__name__)
 
 class GameManager:
     # Reaper: borra salas sin jugadores conectados tras este tiempo (segundos)
     ROOM_TTL_EMPTY = 60
     # Intervalo de escaneo del reaper en segundo plano (segundos)
     ROOM_REAP_INTERVAL = 15
+    # Zombis: inactividad máxima (segundos) de un jugador "conectado" antes de
+    # darlo por muerto. Cubre los half-open TCP: si el cliente se cae sin enviar
+    # el disconnect formal de Socket.IO, su sid queda is_connected=True para
+    # siempre. Configurable por entorno sin tocar código; un valor inválido no
+    # impide el arranque (se cae al default de 300).
+    try:
+        ZOMBIE_TIMEOUT_SECONDS = int(os.environ.get('ZOMBIE_TIMEOUT_SECONDS', 300))
+    except (TypeError, ValueError):
+        ZOMBIE_TIMEOUT_SECONDS = 300
 
     def __init__(self, socketio, white_cards, black_cards):
         self.rooms = {}
         self.socketio = socketio
+        self.logger = logger
         self.global_white_cards = white_cards
         self.global_black_cards = black_cards
         # Bajo async_mode='threading' los handlers corren en hilos reales y pueden
@@ -28,12 +44,15 @@ class GameManager:
         self._start_room_reaper()
 
     def send_room_update(self, room_id):
-        # Se ejecuta dentro del cerrojo del llamador; solo lee estado
+        # Se ejecuta dentro del cerrojo del llamador; muta solo last_seen (ver
+        # nota en _touch_player). Cada difusión entregada es señal de vida del
+        # cliente aunque este no envíe ninguna acción.
         if room_id in self.rooms:
             room = self.rooms[room_id]
             for sid, p in room.players.items():
                 if p.is_connected:
                     payload = room.to_dict(for_sid=sid)
+                    p.last_seen = time.time()
                     self.socketio.emit('game_update', payload, to=sid)
 
     def send_chat_system(self, room_id, message):
@@ -90,8 +109,23 @@ class GameManager:
         self._heal_stale_roles(room)
 
         print(f"{name} se unió a {room_id}")
+        # Un join exitoso es acción real del cliente: renueva su last_seen
+        self._touch_player(sid)
         self.send_room_update(room_id)
         return True
+
+    def _touch_player(self, sid):
+        """Renueva el last_seen del jugador `sid` en todas las salas donde
+        aparezca. El reaper lo usa como señal de vida: si un socket half-open
+        no genera ni acciones ni esta marca, es candidato a purga. Se invoca
+        SIEMPRE bajo self._lock (RLock de la sala/GM), igual que el reaper,
+        para que la lectura/escritura del estado no se intercale con los
+        handlers de juego."""
+        now = time.time()
+        for room in self.rooms.values():
+            p = room.players.get(sid)
+            if p is not None:
+                p.last_seen = now
 
     def _heal_stale_roles(self, room):
         """Autosanado al entrar alguien a la sala: si el líder o el juez
@@ -275,13 +309,57 @@ class GameManager:
             self.socketio.sleep(self.ROOM_REAP_INTERVAL)
 
     def reap_empty_rooms(self):
-        """Elimina las salas que llevan más de ROOM_TTL_EMPTY sin jugadores conectados."""
+        """Pasada periódica del reaper (ciclo de ~ROOM_REAP_INTERVAL s), bajo el
+        RLock global: (1) audita el invariante de conservación de cartas de cada
+        sala activa y (2) purga a los jugadores zombi (sockets half-open cuyo
+        evento 'disconnect' nunca llegó)."""
         with self._lock:
             now = time.time()
+
+            # --- Brainstorm #3: invariante de conservación de cartas ---------
+            # manos + cartas jugadas + pool disponible debe ser igual al tamaño
+            # del mazo. Cualquier desviación delata cartas huérfanas (creadas
+            # o perdidas por un bug). Solo telemetría: NO se muta el estado,
+            # la partida continúa.
+            for room_id, room in self.rooms.items():
+                hands = sum(len(p.hand) for p in room.players.values())
+                played = sum(len(c.get('cards', [])) for c in room.played_cards)
+                current = hands + played + len(room.available_whites)
+                expected = room.deck_size
+                if current != expected:
+                    logger.warning(
+                        "Card drift en sala %s: esperadas=%d actuales=%d "
+                        "(manos=%d jugadas=%d pool=%d, drift=%+d)",
+                        room_id, expected, current,
+                        hands, played, len(room.available_whites), current - expected,
+                    )
+
+            # --- Brainstorm #4: purga de jugadores zombi ---------------------
+            # Un jugador marcado como conectado cuyo last_seen lleva más de
+            # ZOMBIE_TIMEOUT_SECONDS sin actividad (ni acciones entrantes ni
+            # difusiones entregadas) es un socket muerto que nunca emitió
+            # 'disconnect'. Se reutiliza la rutina de limpieza existente
+            # (_disconnect_locked), que gestiona líder, juez, revert y cartel
+            # de sala vacía exactamente igual que una desconexión formal.
+            zombie_sids = []
+            for room_id, room in self.rooms.items():
+                for sid, p in room.players.items():
+                    if p.is_connected and (now - p.last_seen) >= self.ZOMBIE_TIMEOUT_SECONDS:
+                        zombie_sids.append((room_id, sid, p.name, now - p.last_seen))
+            for room_id, sid, name, idle in zombie_sids:
+                logger.info(
+                    "Reaper: purgando zombi '%s' (sid=%s) de la sala %s "
+                    "inactivo %ds sin disconnect formal",
+                    name, sid, room_id, idle,
+                )
+                self._disconnect_locked(sid)
+
+            # --- Limpieza clásica: salas vacías caducadas ---------------------
             expired = [rid for rid, room in self.rooms.items()
                        if room.empty_since is not None and now - room.empty_since >= self.ROOM_TTL_EMPTY]
             for room_id in expired:
                 self._delete_room(room_id)
+
         if expired:
             print(f"Reaper: {len(expired)} sala(s) vacía(s) eliminada(s): {', '.join(expired)}")
 
@@ -690,6 +768,7 @@ class GameManager:
                 custom_data['whiteCards'].append(text)
             for room in self.rooms.values():
                 room.available_whites.append(text)
+                room.deck_size += 1  # el invariante del reaper sigue cuadrando
                 random.shuffle(room.available_whites)
         elif card_type == 'black':
             is_sim, match = check_sim(text, self.global_black_cards)
@@ -950,6 +1029,7 @@ class GameManager:
         for room in self.rooms.values():
             if new_whites:
                 room.available_whites.extend(new_whites)
+                room.deck_size += len(new_whites)  # invariante del reaper: el mazo creció
                 random.shuffle(room.available_whites)
             if new_blacks:
                 room.available_blacks.extend(new_blacks)
@@ -971,6 +1051,7 @@ class GameManager:
                 new_cards = [c.strip() for c in cards_str.split(',') if c.strip()]
                 if new_cards:
                     room.available_whites.extend(new_cards)
+                    room.deck_size += len(new_cards)  # invariante del reaper: el mazo creció
                     random.shuffle(room.available_whites)
                     self.send_chat_system(room_id, f'Se han añadido {len(new_cards)} cartas personalizadas a la sala.')
 
