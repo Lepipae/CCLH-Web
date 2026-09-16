@@ -150,7 +150,13 @@ class GameManager:
     def _pick_new_leader(self, room, active):
         """Nuevo líder al marcharse el actual: prefiere a un jugador conectado que
         no sea espectador (puede iniciar la partida); si solo quedan espectadores,
-        el primero por orden de llegada. None si no queda nadie conectado."""
+        el primero por orden de llegada. None si no queda nadie conectado.
+
+        Nota histórica: la regla original era devolver siempre ``active[0].sid``
+        (el primero conectado por orden de llegada, aunque fuera espectador y no
+        pudiera arrancar la partida); ahora se prioriza a los participantes
+        activos (no espectadores) y solo como último recurso se cae a ese
+        comportamiento antiguo."""
         candidates = [p for p in active if not p.waiting_next_round]
         if candidates:
             return candidates[0].sid
@@ -172,10 +178,7 @@ class GameManager:
                 return
             # No queda ningún jugador conectado con carta jugada: se descarta el
             # recuento huérfano y la ronda vuelve a 'playing'
-            for c in room.played_cards:
-                room.available_whites.extend(c.get('cards', []))
-            random.shuffle(room.available_whites)
-            room.played_cards = []
+            self._discard_round_cards(room)
             room.state = 'playing'
             for p in room.players.values():
                 if not p.is_connected and p.played_card is not None:
@@ -237,14 +240,21 @@ class GameManager:
                 if faltan > 0:
                     p.hand.extend(room.deal_cards(faltan))
 
-    def _revert_to_waiting(self, room):
-        """Devuelve la sala a la pantalla de espera: con menos de dos jugadores
-        reales no puede haber partida en curso."""
-        room.state = 'waiting'
+    def _discard_round_cards(self, room):
+        """Descarta las cartas jugadas de la ronda: las devuelve al mazo
+        (available_whites), baraja y limpia las submissiones (played_cards).
+        No altera room.state ni los played_card de los jugadores: eso lo decide
+        cada llamador según a qué estado esté volviendo la sala."""
         for c in room.played_cards:
             room.available_whites.extend(c.get('cards', []))
         random.shuffle(room.available_whites)
         room.played_cards = []
+
+    def _revert_to_waiting(self, room):
+        """Devuelve la sala a la pantalla de espera: con menos de dos jugadores
+        reales no puede haber partida en curso."""
+        room.state = 'waiting'
+        self._discard_round_cards(room)
         room.renew_votes.clear()
         room.czar = None
         room.black_card = None
@@ -295,22 +305,24 @@ class GameManager:
             room = self.rooms[room_id]
             if room.state == 'waiting' and room.leader == sid:
                 active = room.get_active_players()
-                if len(active) >= 2:
-                    room.state = 'playing'
-                    room.renew_votes.clear()
-                    
-                    hand_size = room.options['hand_size']
-                    for p in active:
-                        p.played_card = None
-                        p.waiting_next_round = False
-                        faltan = hand_size - len(p.hand)
-                        if faltan > 0:
-                            p.hand.extend(room.deal_cards(faltan))
-                            
+                # Guard temprano: sin dos jugadores conectados no se inicia nada.
+                # Va antes de cualquier reparto o mutación de estado para no quemar
+                # cartas del mazo ni activar has_played en el cliente.
                 if len(active) < 2:
                     # Sin jugadores suficientes no se inicia: no se tocan el czar,
                     # la carta negra ni el estado de la sala
                     return
+
+                room.state = 'playing'
+                room.renew_votes.clear()
+
+                hand_size = room.options['hand_size']
+                for p in active:
+                    p.played_card = None
+                    p.waiting_next_round = False
+                    faltan = hand_size - len(p.hand)
+                    if faltan > 0:
+                        p.hand.extend(room.deal_cards(faltan))
 
                 turn_order = room.options['turn_order']
                 if turn_order == 'sequential':
