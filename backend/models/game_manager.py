@@ -214,6 +214,12 @@ class GameManager:
                 if old_czar_sid in connected_ordered:
                     idx = connected_ordered.index(old_czar_sid)
                     room.czar = connected_ordered[(idx + 1) % len(connected_ordered)]
+                elif old_czar_sid in room.join_order:
+                    # El juez se fue: continuar la rotación desde su antigua posición
+                    # en vez de reiniciarla (siguiente conectado tras él)
+                    pos = room.join_order.index(old_czar_sid)
+                    after = [s for s in room.join_order[pos + 1:] if s in connected_ordered]
+                    room.czar = after[0] if after else connected_ordered[0]
                 else:
                     room.czar = connected_ordered[0]
                 return
@@ -243,6 +249,7 @@ class GameManager:
         room.czar = None
         room.black_card = None
         for p in room.players.values():
+            p.played_card = None
             p.waiting_next_round = False
 
     def _start_room_reaper(self):
