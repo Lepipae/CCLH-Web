@@ -5,7 +5,7 @@ el relevo siempre recae en un jugador conectado, la rotación secuencial no se
 reinicia, un ganador desconectado no bloquea el avance y una sala "huérfana"
 se autoasana cuando vuelve a entrar alguien. También verifica la invariante
 de cartas: un inicio fallido no toca manos ni pool, y el descarte de
-submissiones huérfanas devuelve todas las blancas jugadas a `available_whites`.
+submissiones huérfanas devuelve al mazo (`room.deck`) todas las blancas jugadas.
 """
 import pytest
 
@@ -194,7 +194,7 @@ class TestCzarHandoff:
         assert room.state == "judging"
         room_clients("Dave", "CJ4")   # espectadoras de respaldo
         room_clients("Eve", "CJ4")
-        pool = len(room.available_whites)
+        pool = room.deck.count()
 
         m.disconnect(sids["Bob"])     # las dos submissiones quedan huérfanas
         m.disconnect(sids["Carol"])
@@ -206,7 +206,7 @@ class TestCzarHandoff:
         assert room.played_cards == []
         # Las cartas de las dos submissiones descartadas vuelven al mazo
         # (las espectadoras ya habían recibido su mano al entrar)
-        assert len(room.available_whites) == pool + 2
+        assert room.deck.count() == pool + 2
         assert room.players[sids["Bob"]].played_card is None
         dave = sid_of(room, "Dave")
         assert room.czar == dave
@@ -215,7 +215,7 @@ class TestCzarHandoff:
     def test_discarded_submissions_return_all_played_cards_to_available_whites(self, app_module, room_clients):
         """Invariante de conservación del mazo: al descartarse la ronda por la
         marcha del juez, TODAS las blancas jugadas (las de cada submission
-        huérfana) vuelven al pool `available_whites` antes de reabrir 'playing'.
+        huérfana) vuelven al mazo antes de reabrir 'playing'.
 
         Se usa una negra pick=2 para forzar submissions de DOS cartas y así
         verificar que se devuelven todas las cartas jugadas, no solo una por
@@ -246,7 +246,7 @@ class TestCzarHandoff:
         assert played_carol == hand_carol_full[:2]
         room_clients("Dave", "CJ5")   # espectadoras de respaldo: mantienen el
         room_clients("Eve", "CJ5")    # quórum para que no salte el revert a waiting
-        pool_at_judging = len(room.available_whites)  # tras la entrada de las espectadoras
+        pool_at_judging = room.deck.count()  # tras la entrada de las espectadoras
 
         # Se marchan los que jugaron y después la jueza: sin conectados con
         # carta jugada, el recuento huérfano se descarta íntegro
@@ -258,8 +258,8 @@ class TestCzarHandoff:
         assert room.state == "playing"
         assert room.played_cards == []
         # Las 4 cartas jugadas (2 por submission) están de vuelta en el pool
-        assert len(room.available_whites) == pool_at_judging + 4
-        assert set(played_bob) | set(played_carol) <= set(room.available_whites)
+        assert room.deck.count() == pool_at_judging + 4
+        assert set(played_bob) | set(played_carol) <= set(room.deck.pool())
         # Cada jugador conserva íntegro el resto de su mano (el descarte no la toca)
         assert room.players[sids["Bob"]].hand == hand_bob_full[2:]
         assert room.players[sids["Carol"]].hand == hand_carol_full[2:]
@@ -360,7 +360,7 @@ class TestStartGameGuard:
         player = room.players[alice_sid]
         assert len(player.hand) == 0  # sin partida, la mano arranca vacía
         hand_before = len(player.hand)
-        pool_before = len(room.available_whites)
+        pool_before = room.deck.count()
         c_a.get_received()  # drenar el game_update de su propia entrada
 
         c_a.emit("start_game", {"room_id": "S1"})
@@ -376,8 +376,8 @@ class TestStartGameGuard:
         # has_played no se activa (played_card sigue a None)
         assert player.played_card is None
         assert player.to_dict()["has_played"] is False
-        # El pool available_whites no sufre ninguna merma
-        assert len(room.available_whites) == pool_before
+        # El mazo no sufre ninguna merma
+        assert room.deck.count() == pool_before
 
     def test_non_leader_cannot_start(self, app_module, room_clients):
         room_clients("Alice", "S3")

@@ -147,10 +147,10 @@ class TestLiveRooms:
     def test_import_injects_into_active_room_pools(self, client, app_module):
         client.emit("join_game", {"name": "Tester", "room_id": "TESTX"})
         room = app_module.manager.rooms["TESTX"]
-        whites_before = set(map(str, room.available_whites))
+        whites_before = set(map(str, room.deck.pool()))
         res = import_json(client, {"whiteCards": ["Carta para sala activa"]})
         assert res["success"] is True
-        assert "Carta para sala activa" in room.available_whites
+        assert "Carta para sala activa" in room.deck.pool()
         assert "Carta para sala activa" not in whites_before
         assert "Carta para sala activa" in app_module.manager.global_white_cards
 

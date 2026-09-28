@@ -2,7 +2,7 @@ import React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { MessageCircle } from 'lucide-react'
 
-export default function PlayersBanner({ players, onOpenChat, unreadCount }) {
+export default function PlayersBanner({ players, onOpenChat, unreadCount, presencia = {} }) {
   const sortedPlayers = [...players].sort((a, b) => b.points - a.points)
   const top3 = sortedPlayers.slice(0, 3)
 
@@ -17,10 +17,13 @@ export default function PlayersBanner({ players, onOpenChat, unreadCount }) {
               initial={{ opacity: 0, y: -8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -8 }}
-              className="player-chip"
+              className={`player-chip${presencia[p.id]?.state === 'sospechoso' ? ' player-chip-sospechoso' : ''}`}
             >
               {i === 0 && <span className="player-chip-medal">👑</span>}
               <span className="player-chip-name">{p.name}</span>
+              {presencia[p.id]?.state === 'sospechoso' && (
+                <span title="Sin responder desde hace un rato. Si vuelve, recupera su asiento.">⚠️</span>
+              )}
               {p.is_czar && <span title="Juez">🔨</span>}
               {p.has_played && !p.is_czar && <span title="Ya jugó">✅</span>}
               {p.waiting_next_round && !p.is_czar && <span title="Espectador">🕒</span>}

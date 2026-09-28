@@ -1,7 +1,7 @@
 import React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 
-export default function Leaderboard({ players, gameState }) {
+export default function Leaderboard({ players, gameState, presencia = {} }) {
   // Sort players by points
   const sortedPlayers = [...players].sort((a, b) => b.points - a.points)
 
@@ -12,7 +12,13 @@ export default function Leaderboard({ players, gameState }) {
           <AnimatePresence>
             {sortedPlayers.map((p) => {
               let status = ''
-              if (p.is_czar) {
+              // La sospecha va por delante de los demás estados: es lo único
+              // que hay que mirar ahora mismo (le queda un plazo y se le va a
+              // liberar el asiento).
+              const sospechoso = presencia[p.id]?.state === 'sospechoso'
+              if (sospechoso) {
+                status = ' ⚠️'
+              } else if (p.is_czar) {
                 status = ' 🔨'
               } else if (p.waiting_next_round) {
                 status = ' 🕒'
@@ -29,10 +35,12 @@ export default function Leaderboard({ players, gameState }) {
                   initial={{ opacity: 0, x: -20 }}
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, x: -20 }}
-                  className="player-item"
+                  className={`player-item${sospechoso ? ' player-item-sospechoso' : ''}`}
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span>{p.name}{status}</span>
+                    <span title={sospechoso ? 'Sin responder desde hace un rato. Si vuelve, recupera su asiento.' : undefined}>
+                      {p.name}{status}
+                    </span>
                     <span className="badge">{p.points}</span>
                   </div>
                 </motion.li>

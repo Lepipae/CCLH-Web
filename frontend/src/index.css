@@ -192,6 +192,66 @@ button {
     z-index: 100;
 }
 
+.header-left {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+/* Avisos de la máquina de presencia (vivo / sospechoso / purgado) */
+.presence-warning {
+    background: rgba(245, 158, 11, 0.15);
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    color: #fcd34d;
+    padding: 0.25rem 0.6rem;
+    border-radius: 8px;
+    font-size: 0.8rem;
+}
+
+.presence-notices {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+}
+
+.presence-notice {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    background: rgba(0, 0, 0, 0.25);
+    border-left: 2px solid transparent;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+}
+
+.presence-notice.presence-sospechoso {
+    border-left-color: #f59e0b;
+}
+
+.presence-notice.presence-purgado {
+    border-left-color: #ef4444;
+}
+
+.presence-notice.presence-vivo {
+    border-left-color: #10b981;
+}
+
+/* Un jugador sospechoso se marca en su chip, no con un modal: lo que importa
+   es que la mesa sepa a quién está esperando y con qué plazo. */
+.player-chip-sospechoso {
+    border-color: rgba(245, 158, 11, 0.6);
+    background: rgba(245, 158, 11, 0.12);
+    opacity: 0.85;
+}
+
+.player-item-sospechoso {
+    background: rgba(245, 158, 11, 0.12);
+    border-left: 2px solid #f59e0b;
+}
+
 .header-right {
     display: flex;
     align-items: center;

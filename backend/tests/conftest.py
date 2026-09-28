@@ -14,6 +14,8 @@ import tempfile
 
 import pytest
 
+from models.presence import contadores
+
 # `backend/` debe ser la raíz de imports (app, models, ...)
 BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BACKEND_DIR not in sys.path:
@@ -56,6 +58,12 @@ def manager(app_module, test_paths):
     """GameManager con estado limpio: mazo base + cartasCustom.json vacío."""
     m = app_module.manager
     m.rooms.clear()
+    # Los contadores de presencia y de salas rechazadas también son estado de
+    # sesión (viven en el GameManager compartido), así que se reinician aquí:
+    # un test que cuenta transiciones no puede depender de lo que hizo el
+    # anterior.
+    m.presencia = contadores()
+    m.salas_rechazadas = 0
     m.global_white_cards[:] = copy.deepcopy(m.global_white_cards_snapshot)
     m.global_black_cards[:] = copy.deepcopy(m.global_black_cards_snapshot)
     os.makedirs(os.path.dirname(test_paths["internal"]), exist_ok=True)
@@ -89,6 +97,45 @@ def emit(client):
         return received
 
     return _emit
+
+
+# --- Conservación de cartas: se audita después de CADA acción ----------------
+
+@pytest.fixture(autouse=True)
+def deck_audit(manager, monkeypatch):
+    """Corre la conservación de cartas después de cada acción de la partida.
+
+    Antes esto vivía en el reaper, como un WARNING cada 15 segundos: en
+    producción solo decía "algo se perdió" sin señalar qué ni en qué acción, y
+    obligaba a recorrer el estado entero de cada sala bajo el cerrojo global.
+
+    `send_room_update` es el embudo por el que pasan todas las acciones que
+    mutan el estado (unirse, jugar, votar, revelar, cambiar de carta negra,
+    avanzar de ronda, desconectar, purgar zombis, migrar de sala...), así que
+    engancharse ahí equivale a auditar después de cada jugada. Los problemas se
+    acumulan y se reportan juntos al final del test, no en el primero.
+    """
+    problems = []
+
+    def collect():
+        # Copia de la lista: el reaper de fondo puede estar borrando salas.
+        for room in list(manager.rooms.values()):
+            for problem in room.audit_cards():
+                problems.append(f"[{room.room_id}] {problem}")
+
+    broadcast = manager.send_room_update
+
+    def audited_broadcast(room_id):
+        broadcast(room_id)
+        collect()
+
+    monkeypatch.setattr(manager, "send_room_update", audited_broadcast)
+    yield
+    collect()  # red de seguridad: también el estado final del test
+    assert not problems, (
+        "Se han perdido o duplicado cartas de blancas:\n  - "
+        + "\n  - ".join(problems)
+    )
 
 
 # --- Atajos de dominio -------------------------------------------------------

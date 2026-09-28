@@ -1,6 +1,7 @@
 import time
-import random
+from models.presence import Presence
 from models.player import Player
+from models.deck import Deck
 
 class Room:
     def __init__(self, room_id, leader_sid, available_whites, available_blacks):
@@ -12,7 +13,10 @@ class Room:
         self.players = {}  # sid: Player
         self.join_order = []
         
-        self.available_whites = list(available_whites)
+        # El mazo es el único dueño de las cartas blancas: reparte, recoge y
+        # audita. No hay ninguna otra lista de blancas en la sala, así que no
+        # puede existir un contador paralelo que se quede viejo.
+        self.deck = Deck(available_whites)
         self.available_blacks = list(available_blacks)
         self.black_card = None
         self.played_cards = []
@@ -29,15 +33,37 @@ class Room:
         self.last_winner_name = None
 
         # Momento (time.time()) en el que la sala se quedó sin jugadores conectados.
-        # None mientras haya alguien conectado; lo usa el reaper para limpiar salas vacías.
+        # None mientras haya alguien conectado. Es el reloj de silencio de la
+        # máquina de presencia de la sala: el reaper lo mide igual que el last_seen
+        # de un jugador, así que una sala vacía pasa por vivo -> sospechoso ->
+        # purgada con los mismos umbrales con nombre y no con un TTL propio.
+        # `empty_since` queda como atributo de lectura/escritura porque media
+        # partida lo asigna; el estado de verdad está en `presence`.
+        self.presence = Presence()
         self.empty_since = None
 
-        # Snapshot del número de cartas blancas del mazo en el momento de crear
-        # la sala (también se incrementa al inyectar cartas custom en directo).
-        # El reaper lo usa como "total esperado" del invariante de conservación:
-        # manos + cartas jugadas + available_whites == deck_size. Una deriva
-        # distinta de cero delata cartas huérfanas (creadas o perdidas).
-        self.deck_size = len(self.available_whites)
+        # ¿Llegó a haber una partida en esta sala? Lo pone `_start_game_locked` y
+        # NO vuelve a False: es lo que distingue "una sala que alguien usó y
+        # cuyo marcador merece conservarse" de "un lobby que se creó y se quedó
+        # vacío", que es la vía barata de gastar memoria y se purga antes.
+        # Ojo: `state` no sirve para esto, porque al quedarse sin jugadores la
+        # sala vuelve a 'waiting' por el revert, y eso no borra lo ocurrido.
+        self.ha_empezado = False
+
+    # Igual que en Player: `empty_since` es la vista del reloj de la máquina.
+    # Asignar None significa "hay alguien dentro", que es como un viva: perdona
+    # la sospecha de la sala y cancela su periodo de gracia, de modo que quien
+    # vuelve durante la gracia recupera la sala tal cual estaba.
+    @property
+    def empty_since(self):
+        return self.presence.quiet_since
+
+    @empty_since.setter
+    def empty_since(self, moment):
+        if moment is None:
+            self.presence.clear_silence()
+        else:
+            self.presence.set_quiet_since(moment)
 
     def add_player(self, player):
         self.players[player.sid] = player
@@ -55,12 +81,30 @@ class Room:
         return active
 
     def deal_cards(self, count):
-        if len(self.available_whites) < count:
-            return []
-        drawn = random.sample(self.available_whites, count)
-        for c in drawn:
-            self.available_whites.remove(c)
-        return drawn
+        """Reparte del mazo. Menos cartas de las pedidas devuelve []."""
+        return self.deck.deal(count)
+
+    @property
+    def deck_size(self):
+        """Total de cartas blancas que existen en la sala. Derivado del mazo:
+        inyectar cartas custom lo incrementa solo, sin que nadie tenga que
+        acordarse de tocar un contador paralelo."""
+        return self.deck.size
+
+    def audit_cards(self):
+        """Problemas de conservación de cartas. Vacío = todo cuadra.
+
+        Ya no se ejecuta en el reaper: la suite de tests lo corre después de
+        cada acción, que es donde un fallo de conservación se puede atribuir a
+        un cambio concreto en vez de aparecer como un WARNING anónimo 15 s
+        después."""
+        held = []
+        for p in self.players.values():
+            held.extend((f"la mano de {p.name}", card) for card in p.hand)
+        for played in self.played_cards:
+            who = self.players[played['sid']].name if played['sid'] in self.players else played['sid']
+            held.extend((f"la jugada de {who}", card) for card in played.get('cards', []))
+        return self.deck.audit(held)
 
     def to_dict(self, for_sid):
         public_players = []
@@ -117,6 +161,10 @@ class Room:
         }
         
         if for_sid in self.players and self.players[for_sid].is_connected:
-            payload['hand'] = self.players[for_sid].hand
-            
+            # COPIA, no la lista viva: la emisión se difiere fuera del cerrojo,
+            # así que entre que se construye el payload y que sale por el
+            # socket la mano puede haber cambiado. Sin esta copia, el cliente
+            # recibiría una mezcla de dos estados distintos.
+            payload['hand'] = list(self.players[for_sid].hand)
+
         return payload

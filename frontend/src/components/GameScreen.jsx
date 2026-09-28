@@ -9,7 +9,7 @@ import LobbyOptions from './LobbyOptions'
 import CustomCards from './CustomCards'
 import { soundManager } from '../utils/soundManager'
 
-export default function GameScreen({ gameState, mySid, socket }) {
+export default function GameScreen({ gameState, mySid, socket, presencia = {}, avisos = [], miGracia = null }) {
   const { 
     room_id, state, black_card, players, czar, leader, 
     hand, played_cards, winner_sid, renew_votes, 
@@ -100,11 +100,40 @@ export default function GameScreen({ gameState, mySid, socket }) {
   const currentThreshold = options?.renew_threshold || 0.75
   const neededVotes = Math.ceil(total_active * currentThreshold)
 
+  // --- Presencia en dos fases ---------------------------------------------
+  // El estado de cada jugador (vivo / sospechoso / purgado) llega en la propia
+  // foto de la sala, así que el badge de PlayersBanner no depende de que este
+  // cliente hubiera visto el evento. Aquí solo se pinta el aviso y, si el
+  // sospechoso soy yo, la cuenta atrás de lo que me queda de asiento.
+  // El plazo de gracia lo envía el reto (`presence_challenge`) y se muestra tal
+  // cual. Una cuenta atrás al segundo necesitaría un temporizador en el cliente
+  // para compensar el desfase entre los relojes de aquí y del servidor, y aquí
+  // no compensa: lo que le importa a quien está leyendo es cuánto le queda de
+  // margen, no qué punto del segundo le queda.
+  const meSospechosa = presencia[mySid]?.state === 'sospechoso'
+
   return (
     <div className="screen active" style={{ display: 'flex', flexDirection: 'column' }}>
       <header className="game-header">
         <div className="header-left">
           <h2>Sala: {room_id}</h2>
+          {meSospechosa && (
+            <div className="presence-warning" role="status">
+              Te hemos perdido el hilo. Contestamos el reto por ti, pero si no
+              vuelve a hablar en {miGracia?.grace ?? '—'}s se libera tu asiento ⚠️
+            </div>
+          )}
+          {avisos.length > 0 && (
+            <ul className="presence-notices" aria-live="polite">
+              {avisos.map(a => (
+                <li key={a.id} className={`presence-notice presence-${a.state}`}>
+                  {a.state === 'sospechoso' && <>⚠️ <b>{a.name}</b> lleva {a.left ?? '—'}s sin responder. Si vuelve, recupera su asiento.</>}
+                  {a.state === 'purgado' && <>🚪 Se ha liberado el asiento de <b>{a.name}</b> (sin respuesta).</>}
+                  {a.state === 'vivo' && <>✅ <b>{a.name}</b> ha vuelto. Su asiento se conserva.</>}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
         <div className="header-right" style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
           <span id="player-name">{me?.name || 'Espectador'}</span>
@@ -134,11 +163,12 @@ export default function GameScreen({ gameState, mySid, socket }) {
       <div className="game-layout">
         <PlayersBanner
           players={players}
+          presencia={presencia}
           onOpenChat={() => { setChatOpen(true); setUnreadChat(0) }}
           unreadCount={unreadChat}
         />
         <aside className="sidebar">
-          <Leaderboard players={players} gameState={state} />
+          <Leaderboard players={players} gameState={state} presencia={presencia} />
           <Chat variant="sidebar" messages={chatMessages} onSend={handleSendChat} />
         </aside>
 

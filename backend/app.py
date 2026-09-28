@@ -1,7 +1,7 @@
 import json
 import os
 from flask import Flask, request, send_from_directory
-from flask_socketio import SocketIO, join_room, emit
+from flask_socketio import SocketIO, join_room, leave_room, emit
 from models.game_manager import GameManager
 
 # Configurar Flask para servir archivos estáticos del frontend de React
@@ -64,7 +64,7 @@ def cargar_cartas():
             w_text = w if isinstance(w, str) else w.get('text', '')
             if w_text and w_text not in [cw if isinstance(cw, str) else cw.get('text', '') for cw in custom_data['whiteCards']]:
                 custom_data['whiteCards'].append(w)
-                
+
         for b in source_json.get('blackCards', []):
             b_text = b if isinstance(b, str) else b.get('text', '')
             if b_text and b_text not in [cb if isinstance(cb, str) else cb.get('text', '') for cb in custom_data['blackCards']]:
@@ -127,13 +127,28 @@ def index():
 def serve_static(path):
     return app.send_static_file(path)
 
+
 @socketio.on('join_game')
 def on_join(data):
     name = data.get('name', 'Anon').strip()
     room_id = data.get('room_id', 'lobby').strip().upper()
     if name and room_id:
+        # Sala de Socket.IO de la que venía este sid, para soltarla: sin esto
+        # seguía recibiendo las difusiones de chat de la sala abandonada.
+        prev_room = manager.room_of(request.sid)
         if manager.join_game(request.sid, name, room_id):
+            if prev_room and prev_room != room_id:
+                leave_room(prev_room)
             join_room(room_id)
+
+
+@socketio.on('heartbeat_pong')
+def on_heartbeat_pong():
+    # Contestación del latido que emite el reaper. Es la señal de vida que
+    # consume la purga de zombis: 'disconnect' no siempre llega cuando el
+    # socket queda half-open detrás del túnel.
+    manager.heartbeat(request.sid)
+
 
 @socketio.on('disconnect')
 def on_disconnect():
