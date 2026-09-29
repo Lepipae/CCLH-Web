@@ -12,14 +12,19 @@ import shutil
 import sys
 import tempfile
 
-import pytest
-
-from models.presence import contadores
-
-# `backend/` debe ser la raíz de imports (app, models, ...)
+# `backend/` debe ser la raíz de imports (app, models, ...).
+#
+# Este bloque va ANTES de cualquier import del proyecto a propósito: pytest carga
+# este conftest antes que los módulos de test, así que preparar sys.path aquí es lo
+# que permite que la suite funcione tanto con `cd backend && pytest tests` como con
+# `python -m pytest backend/tests` desde la raíz del repo (lo que ejecuta el CI).
 BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
+
+import pytest  # noqa: E402
+
+from models.presence import contadores  # noqa: E402
 
 
 @pytest.fixture(scope="session")
