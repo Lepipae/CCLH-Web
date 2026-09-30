@@ -125,7 +125,7 @@ El orden entre ellos es fijo —**registro antes que sala, nunca al revés**— 
 
 La emisión va siempre por un lote (`models/outbox.py`): con el cerrojo tomado se lee el estado y se serializa el snapshot, y el socket se escribe al salir. Ninguna E/S ocurre con un cerrojo de juego tomado.
 
-Dos tareas periódicas trabajan en segundo plano: el **reaper** pide un latido a cada cliente conectado y hace avanzar la máquina de presencia (vivo → sospechoso → purgado) de jugadores y salas, y `GET /metrics` devuelve una instantánea numérica del proceso (salas, jugadores, fases de presencia, salas rechazadas por el techo).
+Una tarea periódica trabaja en segundo plano: el **reaper** pide un latido a cada cliente conectado y hace avanzar la máquina de presencia (vivo → sospechoso → purgado) de jugadores y salas, y purga las que se quedan vacías. Para mirarlo por fuera, `GET /metrics` devuelve una instantánea numérica del proceso (salas, jugadores, fases de presencia, salas rechazadas por el techo); el chat se limita a 500 caracteres y las cartas propias a 200, porque el `maxlength` del navegador no es una defensa.
 
 Para desarrollar el frontend con recarga en caliente (`npm run dev` en Vite) es necesario que el backend esté accesible desde el puerto del servidor de desarrollo; la configuración actual conecta Socket.IO contra el mismo origen, por lo que la vía simple es desarrollar contra el build compilado o añadir un proxy en `vite.config.js`.
 

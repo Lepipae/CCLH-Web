@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from models.game_manager import MAX_CHAT
 from models.presence import PresencePolicy, SOSPECHOSO
 from test_disconnect_roles import make_client, room_clients  # noqa: F401 (fixture)
 
@@ -242,3 +243,37 @@ class TestPlazoSegunLaSalaHayaEmpezado:
         _politicas(manager, monkeypatch, 0.05, 900)  # la larga ya no manda
         manager.reap_empty_rooms()
         assert "MIDE" not in manager.rooms
+
+
+# --- Tope del mensaje de chat -----------------------------------------------
+
+class TestTopeDelChat:
+    """El `maxlength` del input del cliente es una comodidad, no una defensa: el
+    chat se difunde a la mesa entera, así que lo que llega por el socket tiene
+    que estar acotado en el servidor. Mismo espíritu que `MAX_ROOMS`: un cliente
+    (o un bundle viejo) no puede convertir el chat en una vía de envío."""
+
+    def test_un_mensaje_basura_no_llega_a_nadie(self, manager, room_clients):
+        clients, sids = {}, {}
+        for nombre in ("Ana", "Beto"):
+            clients[nombre], sids[nombre] = room_clients(nombre, "CHAT")
+        for basura in (None, "", "   ", 42, {"texto": "hola"}, ["hola"]):
+            manager.send_chat(sids["Ana"], "CHAT", basura)
+        for cliente in clients.values():
+            assert not [e for e in cliente.get_received() if e['name'] == 'chat_message']
+
+    def test_un_mensaje_enorme_se_recorta(self, manager, room_clients):
+        """Con el tope, lo que se difunde a la mesa es acotado aunque el
+        cliente mande un megabyte."""
+        clients, sids = {}, {}
+        for nombre in ("Ana", "Beto"):
+            clients[nombre], sids[nombre] = room_clients(nombre, "LONG")
+        for cliente in clients.values():
+            cliente.get_received()
+
+        manager.send_chat(sids["Ana"], "LONG", "x" * (MAX_CHAT * 10))
+
+        recibidos = [e['args'][0] for e in clients["Beto"].get_received()
+                     if e['name'] == 'chat_message']
+        assert len(recibidos) == 1
+        assert len(recibidos[0]['msg']) == MAX_CHAT
