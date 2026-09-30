@@ -1,12 +1,19 @@
 import json
 import os
-from flask import Flask, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_socketio import SocketIO, join_room, leave_room, emit
 from models.game_manager import GameManager
 
 # Configurar Flask para servir archivos estáticos del frontend de React
 app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
-app.config['SECRET_KEY'] = 'secreto_super_seguro'
+# La clave de sesión solo se usa para firmar las cookies de Socket.IO, pero
+# hardcodeada era una credencial en el repo. Se lee del entorno y, si no está,
+# se genera una por proceso: reiniciar invalida las sesiones viejas, que es
+# exactamente lo que se quiere si nadie ha configurado nada (el estado de las
+# partidas tampoco sobrevive a un reinicio, así que no se pierde nada). Con un
+# solo worker, como manda el Dockerfile; con varios, cada uno tendría la suya y
+# las cookies dejarían de valar de un worker a otro.
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or os.urandom(24).hex()
 # Permitimos CORS a Vite. async_mode='threading' usa el servidor de Flask/Werkzeug
 # con simple-websocket para soporte de WebSocket (sin eventlet ni gevent).
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
@@ -123,15 +130,46 @@ manager = GameManager(socketio, CARTAS_BLANCAS, CARTAS_NEGRAS)
 def index():
     return app.send_static_file('index.html')
 
+@app.route('/metrics')
+def metrics():
+    """Instantánea numérica del proceso, en JSON.
+
+    La ruta compite con el `catch-all` de estáticos de abajo (`/<path:path>`),
+    que sirve `frontend/dist`. No hace falta declararla antes: Werkzeug ordena
+    las reglas por especificidad, no por orden de declaración, y una ruta
+    literal siempre gana a un conversor. Se deja igualmente antes del
+    `catch-all` para que se lea en el orden en que se aplica.
+    """
+    return jsonify(manager.metrics())
+
+
 @app.route('/<path:path>')
 def serve_static(path):
     return app.send_static_file(path)
 
 
+def _datos(data):
+    """El payload del cliente, o un dict vacío si no es un objeto.
+
+    Todo lo que entra por el socket es dato no confiable: puede no venir (si el
+    cliente emite sin cuerpo), puede no ser un objeto, y sus campos pueden ser
+    de cualquier tipo. Normalizar aquí evita repetir el mismo escudo en cada
+    handler y, sobre todo, evita que un `data.get(...)` reventado por un payload
+    raro tumbe el handler entero con un AttributeError.
+    """
+    return data if isinstance(data, dict) else {}
+
+
+def _texto(valor, defecto=''):
+    """Un campo de texto del cliente ya recortado, o el defecto si no lo es."""
+    return valor.strip() if isinstance(valor, str) else defecto
+
+
 @socketio.on('join_game')
 def on_join(data):
-    name = data.get('name', 'Anon').strip()
-    room_id = data.get('room_id', 'lobby').strip().upper()
+    data = _datos(data)
+    name = _texto(data.get('name'), 'Anon')
+    room_id = _texto(data.get('room_id'), 'lobby').upper()
     if name and room_id:
         # Sala de Socket.IO de la que venía este sid, para soltarla: sin esto
         # seguía recibiendo las difusiones de chat de la sala abandonada.
@@ -156,42 +194,48 @@ def on_disconnect():
 
 @socketio.on('start_game')
 def on_start_game(data):
-    manager.start_game(request.sid, data.get('room_id', '').upper())
+    manager.start_game(request.sid, _texto(_datos(data).get('room_id')).upper())
 
 @socketio.on('update_room_options')
 def on_update_room_options(data):
-    manager.update_options(request.sid, data.get('room_id', '').upper(), data)
+    data = _datos(data)
+    manager.update_options(request.sid, _texto(data.get('room_id')).upper(), data)
 
 @socketio.on('play_card')
 def on_play_card(data):
-    manager.play_card(request.sid, data.get('room_id', '').upper(), data.get('card_index'))
+    data = _datos(data)
+    manager.play_card(request.sid, _texto(data.get('room_id')).upper(), data.get('card_index'))
 
 @socketio.on('reveal_card')
 def on_reveal_card(data):
-    manager.reveal_card(request.sid, data.get('room_id', '').upper(), data.get('sub_id'))
+    data = _datos(data)
+    manager.reveal_card(request.sid, _texto(data.get('room_id')).upper(), data.get('sub_id'))
 
 @socketio.on('choose_winner')
 def on_choose_winner(data):
-    manager.choose_winner(request.sid, data.get('room_id', '').upper(), data.get('sub_id'))
+    data = _datos(data)
+    manager.choose_winner(request.sid, _texto(data.get('room_id')).upper(), data.get('sub_id'))
 
 @socketio.on('vote_card')
 def on_vote_card(data):
-    manager.vote_card(request.sid, data.get('room_id', '').upper(), data.get('card_id'))
+    data = _datos(data)
+    manager.vote_card(request.sid, _texto(data.get('room_id')).upper(), data.get('card_id'))
 
 @socketio.on('next_round')
 def on_next_round(data):
-    manager.force_next_round(request.sid, data.get('room_id', '').upper())
+    manager.force_next_round(request.sid, _texto(_datos(data).get('room_id')).upper())
 
 @socketio.on('vote_renew')
 def on_vote_renew(data):
-    manager.vote_renew(request.sid, data.get('room_id', '').upper())
+    manager.vote_renew(request.sid, _texto(_datos(data).get('room_id')).upper())
 
 @socketio.on('change_black_card')
 def on_change_black_card(data):
-    manager.change_black_card(request.sid, data.get('room_id', '').upper())
+    manager.change_black_card(request.sid, _texto(_datos(data).get('room_id')).upper())
 
 @socketio.on('add_custom_card')
 def on_add_custom_card(data):
+    data = _datos(data)
     def respond_cb(res):
         emit('custom_card_result', res)
     manager.add_custom_card(data.get('type'), data.get('text', ''), data.get('pick', 1), respond_cb)
@@ -204,6 +248,7 @@ def on_get_custom_cards():
 
 @socketio.on('delete_custom_card')
 def on_delete_custom_card(data):
+    data = _datos(data)
     def respond_cb(res):
         emit('custom_card_deleted', res)
     manager.delete_custom_card(data.get('type'), data.get('text', ''), respond_cb)
@@ -213,15 +258,17 @@ def on_import_custom_cards(data):
     # El cliente envía el contenido del archivo .json ya parseado (objeto) o como texto crudo
     def respond_cb(res):
         emit('custom_cards_imported', res)
-    manager.import_custom_cards(data.get('json'), respond_cb)
+    manager.import_custom_cards(_datos(data).get('json'), respond_cb)
 
 @socketio.on('add_room_cards')
 def on_add_room_cards(data):
-    manager.add_room_cards(data.get('room_id', '').upper(), data.get('cards', ''))
+    data = _datos(data)
+    manager.add_room_cards(_texto(data.get('room_id')).upper(), data.get('cards', ''))
 
 @socketio.on('send_chat')
 def on_send_chat(data):
-    manager.send_chat(request.sid, data.get('room_id', '').upper(), data.get('msg', ''))
+    data = _datos(data)
+    manager.send_chat(request.sid, _texto(data.get('room_id')).upper(), data.get('msg', ''))
 
 if __name__ == '__main__':
     # Servidor embebido (Werkzeug) solo para desarrollo local.

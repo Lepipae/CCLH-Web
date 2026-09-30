@@ -2,15 +2,16 @@
 cliente lento.
 
 La sonda es `manager.heartbeat(sid)`: una operación que solo necesita el cerrojo
-global y no hace NADA de E/S (renueva un `last_seen` y sale). Lo que tarda es,
-exactamente, el tiempo que el resto del servidor estuvo retenido. En el hilo
+de una sala y no hace NADA de E/S (renueva un `last_seen` y sale). Lo que tarda
+es, exactamente, el tiempo que ese cerrojo estuvo retenido. En el hilo
 principal, en cambio, se simula un socket de 5 ms por mensaje, que es lo que
 costaba un `emit` de verdad.
 
     python bench_emision.py
 
 Compara el comportamiento actual con el anterior al cambio (el drenaje por
-dentro del `with self._lock`, que se reproduce parcheando la transacción).
+dentro del `with self._lock`, que se reproduce parcheando `_tx_sala` para que
+escriba el lote sin haber soltado el cerrojo de la sala).
 """
 import os
 import sys
@@ -21,7 +22,6 @@ from contextlib import contextmanager
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import models.game_manager as gm_module  # noqa: E402
-from models.outbox import EmitBatch  # noqa: E402
 
 BLANCAS = [f"blanca {i}" for i in range(60)]
 NEGRAS = [{"text": f"negra {i} _", "pick": 1} for i in range(20)]
@@ -53,22 +53,33 @@ def manager_nuevo():
 
 def drenar_dentro_del_cerrojo(gm):
     """Reproduce el comportamiento de antes del cambio: el lote se escribe en el
-    socket con el cerrojo global todavía tomado."""
+    socket con el cerrojo de la sala todavía tomado.
+
+    Solo afecta a la transacción MÁS EXTERNA (las anidadas se funden con la de
+    fuera, como siempre): es la que en el modelo antiguo sostenía el cerrojo
+    global mientras escribía. Vaciar el lote después de escribirlo evita que el
+    drenaje "correcto" de la transacción emita todo otra vez."""
+    original = gm_module.GameManager._tx_sala
+
     @contextmanager
-    def transaction_ingenuo():
-        with gm._lock:
-            lote = EmitBatch()
-            pila = gm._outbox._stack()
-            pila.append(lote)
+    def tx_sala_ingenua(self, room_id, room=None):
+        if self._outbox._stack():          # anidada: normal
+            with original(self, room_id, room) as sala:
+                yield sala
+            return
+        with original(self, room_id, room) as sala:
             try:
-                yield lote
+                yield sala
             finally:
-                pila.pop()
-                if pila:
-                    pila[-1].merge(lote)
-                if not pila:
-                    gm._outbox.flush(lote)      # <- aquí, con el cerrojo tomado
-    gm._outbox.transaction = transaction_ingenuo
+                if self._outbox._stack():
+                    lote = self._outbox._stack()[-1]
+                    self._outbox.flush(lote)     # <- aquí, con el cerrojo tomado
+                    lote.updates.clear()
+                    lote.directs.clear()
+                    lote.replies.clear()
+
+    gm_module.GameManager._tx_sala = tx_sala_ingenua
+    return lambda: setattr(gm_module.GameManager, "_tx_sala", original)
 
 
 def sonda(gm, trabajo, esperar_ms=EMIT_MS * 2):
@@ -81,7 +92,7 @@ def sonda(gm, trabajo, esperar_ms=EMIT_MS * 2):
         listo.wait(5)
         time.sleep(esperar_ms / 1000.0)      # situarse a mitad del trabajo
         t0 = time.perf_counter()
-        gm.heartbeat("S0")                   # sin E/S: solo pide el cerrojo
+        gm.heartbeat(gm.sondas[0])           # sin E/S: solo pide el cerrojo
         paradas.append((time.perf_counter() - t0) * 1000)
 
     hilo = threading.Thread(target=rival)
@@ -120,7 +131,11 @@ def preparar_servidor(gm):
             gm.heartbeat(f"S{s}-{n}")
             n += 1
             if n >= CONECTADOS:
-                return
+                break
+        if n >= CONECTADOS:
+            break
+    # La sonda mira el cerrojo de la sala S0, que es la primera que recorre el
+    # reaper: es donde antes se notaba el atasco y donde ahora no debe notarse.
     gm.sondas = ["S0-0"]
 
 
@@ -132,15 +147,20 @@ def main():
     print(f"{'escenario':<44}{'antes':>12}{'ahora':>12}{'ganancia':>10}")
     print("-" * 78)
     for titulo, preparar, trabajo in escenarios:
-        Measured = []
+        measured = []
         for dentro in (True, False):
             gm = manager_nuevo()
             preparar(gm)
-            if dentro:
-                drenar_dentro_del_cerrojo(gm)
-            peor = max(sonda(gm, lambda: trabajo(gm))[0] for _ in range(3))
-            Measured.append(peor)
-        antes, ahora = Measured
+            # `dentro` parchea la CLASE, así que hay que devolverla a su sitio
+            # antes de medir el otro extremo (si no, los dos serían "antes").
+            restaurar = drenar_dentro_del_cerrojo(gm) if dentro else None
+            try:
+                peor = max(sonda(gm, lambda: trabajo(gm))[0] for _ in range(3))
+            finally:
+                if restaurar:
+                    restaurar()
+            measured.append(peor)
+        antes, ahora = measured
         print(f"{titulo:<44}{antes:>9.1f} ms{ahora:>9.1f} ms"
               f"{antes / max(ahora, 0.001):>9.0f}x")
 

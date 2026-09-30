@@ -19,10 +19,12 @@ class Player:
         # impide que la sospecha sea una sentencia en la misma pasada.
         self.presence = Presence(quiet_since=time.time())
 
-        # Cuántos latidos ha respondido este cliente. Mientras sea 0 no tenemos
-        # ninguna evidencia de que sepa contestar, y por tanto tampoco prueba de
-        # que esté muerto: el reaper se abstiene de sospechar siquiera. En cuanto
-        # responde uno, su silencio posterior sí es prueba.
+        # Cuántos latidos ha respondido este cliente. No es un seguro de vida,
+        # es el selector de política: mientras sea 0 el reaper juzga a este
+        # jugador con PRESENCE_SIN_PRUEBA (más margen, pero judgment incluido)
+        # y a partir del primero con PRESENCE. Antes de esto valía como
+        # exención permanente y un cliente que nunca contestaba fijaba su sala
+        # para siempre, porque su transporte seguía vivo aunque su JS no.
         self.heartbeat_pongs = 0
 
     # `last_seen` es la ÚNICA fuente del reloj de silencio, y ahora vive dentro

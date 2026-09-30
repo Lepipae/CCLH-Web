@@ -114,7 +114,18 @@ La aplicación quedará disponible en `http://localhost:3000`. Existe también `
 
 ### Modelo de concurrencia
 
-El servidor usa Flask-SocketIO en `async_mode='threading'` con `simple-websocket` (sin eventlet ni gevent, ambos en desuso y problemáticos en Python moderno). En producción Gunicorn arranca un único worker `gthread` con 100 hilos: un solo proceso es obligatorio porque el estado de las partidas vive en memoria. Todas las operaciones del juego se serializan con un `RLock` en `GameManager`, y un tarea periódica elimina las salas que llevan un tiempo sin jugadores conectados.
+El servidor usa Flask-SocketIO en `async_mode='threading'` con `simple-websocket` (sin eventlet ni gevent, ambos en desuso y problemáticos en Python moderno). En producción Gunicorn arranca un único worker `gthread` con 100 hilos: un solo proceso es obligatorio porque el estado de las partidas vive en memoria.
+
+El estado de juego se serializa con **dos cerrojos**, no con uno global:
+
+- **`Room.lock`**: el estado de UNA mesa. Dos mesas juegan en paralelo y una mesa con un cliente lento no detiene a las demás.
+- **`GameManager._registro_lock`**: lo que no es de una mesa (el diccionario de salas, el techo de salas, las listas de cartas del mazo global). Se toma un instante y se suelta.
+
+El orden entre ellos es fijo —**registro antes que sala, nunca al revés**— porque es la condición para que no haya un deadlock; `GameManager._registro()` lo verifica y falla ruidosamente si alguien lo incumple. Las operaciones que cruzan mesas (unirse soltando la sala de origen, una desconexión) bloquean todas las salas implicadas en un orden total por `room_id`.
+
+La emisión va siempre por un lote (`models/outbox.py`): con el cerrojo tomado se lee el estado y se serializa el snapshot, y el socket se escribe al salir. Ninguna E/S ocurre con un cerrojo de juego tomado.
+
+Dos tareas periódicas trabajan en segundo plano: el **reaper** pide un latido a cada cliente conectado y hace avanzar la máquina de presencia (vivo → sospechoso → purgado) de jugadores y salas, y `GET /metrics` devuelve una instantánea numérica del proceso (salas, jugadores, fases de presencia, salas rechazadas por el techo).
 
 Para desarrollar el frontend con recarga en caliente (`npm run dev` en Vite) es necesario que el backend esté accesible desde el puerto del servidor de desarrollo; la configuración actual conecta Socket.IO contra el mismo origen, por lo que la vía simple es desarrollar contra el build compilado o añadir un proxy en `vite.config.js`.
 
@@ -160,12 +171,19 @@ Son utilidades de una sola ejecución; no forman parte del servicio ni se ejecut
 
 ```
 backend/
-  app.py               # Servidor Flask + rutas Socket.IO
+  app.py               # Servidor Flask + rutas Socket.IO + /metrics
   models/
-    game_manager.py    # Lógica de salas, rondas y votaciones
+    game_manager.py    # Lógica de salas, rondas y votaciones; cerrojos y reaper
     room.py            # Estado de sala y serialización por jugador
     player.py          # Estado de jugador
+    deck.py            # Mazo de la sala y auditoría de conservación de cartas
+    presence.py        # Máquina de presencia en dos fases y sus plazos
+    outbox.py          # Lote de salida: se encola bajo cerrojo, se emite sin él
+    custom_cards.py    # Alta, baja, listado e importación de cartas propias
   DataScraping/        # Mazo base JSON, cartas custom y scrapers
+  tests/               # Suite de pytest (presencia, reaper, cartas, cerrojos)
+  reversion.py         # Comprueba por reversión que cada defensa tiene su test
+  bench_emision.py     # Mide cuánto se para el resto por un cliente lento
 frontend/
   src/
     App.jsx            # Conexión Socket.IO y navegación de pantallas

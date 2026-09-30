@@ -88,11 +88,15 @@ def _auto_next_round_sin_dormir(manager, room_id, czar_sid):
 
     Es la tarea en segundo plano que lanza `choose_winner`. En vez de dispararse
     sola tras 5 s (imposible de sincronizar), el fuzz la encola y la ejecuta
-    cuando le parece."""
-    with manager._lock:
-        room = manager.rooms.get(room_id)
-        if room and room.state == "round_end" and room.czar == czar_sid:
-            manager.advance_to_next_round(room_id)
+    cuando le parece. replica el cerrojo POR SALA del original: la sala se
+    resuelve, se bloquea, y la sala ya bloqueada se le pasa a
+    `advance_to_next_round` para que no vuelva a buscarla en el registro."""
+    room = manager.rooms.get(room_id)
+    if room is None:
+        return
+    with manager._sala(room):
+        if room.state == "round_end" and room.czar == czar_sid:
+            manager.advance_to_next_round(room_id, room)
 
 
 @pytest.fixture()

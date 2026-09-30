@@ -34,20 +34,21 @@ CAMBIOS = [
      "        if self.state == SOSPECHOSO:\n            self.deadline = now + policy.grace\n            return False\n        if self.state != VIVO:\n            return False\n",
      "tests/test_presence_machine.py"),
 
-    ("sin prueba previa de latido se sospecha igual",
+    ("sin prueba previa de latido se juzga con el plazo de siempre",
      "models/game_manager.py",
-     "                if not p.is_connected or p.heartbeat_pongs == 0:\n                    continue\n",
-     "                if not p.is_connected:\n                    continue\n",
+     "            politica = (self.PRESENCE if p.heartbeat_pongs\n"
+     "                        else self.PRESENCE_SIN_PRUEBA)\n",
+     "            politica = self.PRESENCE\n",
      "tests/test_presence_machine.py tests/test_reaper_defenses.py"),
 
     ("sospechar y purgar en la misma pasada (elif -> if)",
      "models/game_manager.py",
-     "                if p.presence.accuse(now, self.PRESENCE):\n"
-     "                    sospechosos.append((room, sid, p))\n"
-     "                elif p.presence.purge_due(now):\n",
-     "                if p.presence.accuse(now, self.PRESENCE):\n"
-     "                    sospechosos.append((room, sid, p))\n"
-     "                if p.presence.purge_due(now):\n",
+     "            if p.presence.accuse(now, politica):\n"
+     "                sospechosos.append((sid, p))\n"
+     "            elif p.presence.purge_due(now):\n",
+     "            if p.presence.accuse(now, politica):\n"
+     "                sospechosos.append((sid, p))\n"
+     "            if p.presence.purge_due(now):\n",
      "tests/test_presence_machine.py"),
 
     ("el estado de presencia no viaja en el game_update",
@@ -59,41 +60,46 @@ CAMBIOS = [
     # --- Límites de salas -------------------------------------------------
     ("sin techo de salas: join_game crea las que le pidan",
      "models/game_manager.py",
-     "            if len(self.rooms) >= self.MAX_ROOMS:\n",
-     "            if False and len(self.rooms) >= self.MAX_ROOMS:\n",
+     "            lleno = room is None and len(self.rooms) >= self.MAX_ROOMS\n",
+     "            lleno = False\n",
      "tests/test_limites_de_sala.py"),
 
     ("el techo se comprueba ANTES de saber si la sala es nueva (cierra mesas vivas)",
      "models/game_manager.py",
-     "        if room_id not in self.rooms:\n",
-     "        if len(self.rooms) >= self.MAX_ROOMS:\n"
-     "            self.salas_rechazadas += 1\n"
-     "            self._outbox.add_direct(room_id, 'join_error', {'message': 'lleno'}, to=sid)\n"
-     "            return False\n"
-     "        if room_id not in self.rooms:\n",
+     "            room = self.rooms.get(room_id)\n"
+     "            # Techo de salas. Va ANTES de crear nada: una sala rechazada no\n"
+     "            # ocupa memoria ni aparece en el `game_update` de nadie. Solo crear\n",
+     "            if len(self.rooms) >= self.MAX_ROOMS:\n"
+     "                self._contar_sala_rechazada()\n"
+     "                origenes = []\n"
+     "            else:\n"
+     "                room = self.rooms.get(room_id)\n"
+     "            # Techo de salas. Va ANTES de crear nada: una sala rechazada no\n"
+     "            # ocupa memoria ni aparece en el `game_update` de nadie. Solo crear\n",
      "tests/test_limites_de_sala.py"),
 
     ("el rechazo no avisa al cliente (se traga el error)",
      "models/game_manager.py",
+     "            with self._tx_registro():\n"
      "                self._outbox.add_direct(room_id, 'join_error', {\n"
      "                    'message': 'El servidor est\u00e1 lleno de salas ahora mismo. '\n"
      "                               'Prueba con otro c\u00f3digo en un momento.'}, to=sid)\n"
-     "                return False\n",
-     "                return False\n",
+     "            return False\n",
+     "            return False\n",
      "tests/test_limites_de_sala.py"),
 
     ("un solo plazo para todas las salas (el de la partida, para las nuevas)",
      "models/game_manager.py",
-     "            politica = (self.ROOM_LIFECYCLE if room.ha_empezado\n"
-     "                        else self.ROOM_LIFECYCLE_NUEVA)\n",
-     "            politica = self.ROOM_LIFECYCLE\n",
+     "        politica = (self.ROOM_LIFECYCLE if room.ha_empezado\n"
+     "                    else self.ROOM_LIFECYCLE_NUEVA)\n",
+     "        politica = self.ROOM_LIFECYCLE\n",
      "tests/test_limites_de_sala.py tests/test_reaper_defenses.py"),
 
     ("un solo plazo para todas las salas (el corto, para las partidas)",
      "models/game_manager.py",
-     "            politica = (self.ROOM_LIFECYCLE if room.ha_empezado\n"
-     "                        else self.ROOM_LIFECYCLE_NUEVA)\n",
-     "            politica = self.ROOM_LIFECYCLE_NUEVA\n",
+     "        politica = (self.ROOM_LIFECYCLE if room.ha_empezado\n"
+     "                    else self.ROOM_LIFECYCLE_NUEVA)\n",
+     "        politica = self.ROOM_LIFECYCLE_NUEVA\n",
      "tests/test_limites_de_sala.py"),
 
     ("la marca de 'ya empezó' se pierde al revertir a waiting",

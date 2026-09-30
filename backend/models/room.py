@@ -1,4 +1,4 @@
-import time
+import threading
 from models.presence import Presence
 from models.player import Player
 from models.deck import Deck
@@ -9,6 +9,14 @@ class Room:
         self.leader = leader_sid
         self.state = 'waiting'  # waiting, playing, judging, round_end
         self.czar = None
+
+        # Cerrojo PROPIO de esta sala. Antes había un único RLock global para
+        # todo el servidor, así que una mesa con un cliente lento paraba las
+        # demás; ahora cada mesa se serializa consigo misma y las mesas van en
+        # paralelo. RLock y no Lock porque las transacciones se anidan con
+        # mucha naturalidad (choose_winner -> send_room_update -> ...) y todas
+        # son legítimamente reentrantes desde el mismo hilo.
+        self.lock = threading.RLock()
         
         self.players = {}  # sid: Player
         self.join_order = []
@@ -65,6 +73,24 @@ class Room:
         else:
             self.presence.set_quiet_since(moment)
 
+    def asiento(self, sid):
+        """El jugador con asiento ACTIVO de `sid`, o None.
+
+        ESTA es la puerta de autorización de la sala, y no un azúcar: estar en
+        `players` no basta para mandar aquí dentro. Un asiento purgado por el
+        reaper o simplemente desconectado sigue en el diccionario a propósito
+        (su mano y su marcador se conservan, y la auditoría de cartas cuenta
+        con ellos dentro), pero ya no tiene autoridad: su socket puede seguir
+        abierto y sus eventos seguir llegando.
+
+        Autorizar por pertenencia en vez de por asiento era un agujero real: un
+        jugador al que el reaper ya había purgado podía seguir jugando cartas y
+        chateando, porque `sid in players` seguía siendo cierto. La purga hace
+        invisible el asiento, no lo deja sin poderes.
+        """
+        p = self.players.get(sid)
+        return p if p is not None and p.is_connected else None
+
     def add_player(self, player):
         self.players[player.sid] = player
         if player.sid not in self.join_order:
@@ -76,9 +102,20 @@ class Room:
             self.renew_votes.discard(sid)
 
     def get_active_players(self):
-        active = [p for p in self.players.values() if p.is_connected]
-        self.empty_since = None if active else (self.empty_since or time.time())
-        return active
+        """Jugadores con asiento activo. SOLO LEE.
+
+        Antes, además de contar, movía el reloj de la sala (si no quedaba nadie
+        conectado, arrancaba `empty_since`), y como `to_dict` lo llama para
+        saber cuánta gente vota la renovación, MEDIR una mesa también la
+        mantenía viva: un getter que mutaba la máquina de presencia, con un
+        `or time.time()` que además trata un reloj legítimo de 0.0 como "no
+        puesto".
+
+        El reloj lo mueve quien sabe por qué la mesa se queda vacía, que es uno
+        solo y se llama en cada desconexión y en cada purga:
+        `_release_from_room`.
+        """
+        return [p for p in self.players.values() if p.is_connected]
 
     def deal_cards(self, count):
         """Reparte del mazo. Menos cartas de las pedidas devuelve []."""

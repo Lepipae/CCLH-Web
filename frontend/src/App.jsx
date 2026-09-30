@@ -102,6 +102,22 @@ function App() {
         ...prev,
       ].slice(0, MAX_AVISOS))
       if (data.state === 'vivo') setMiGracia(null)
+      // Si el liberado soy YO, el servidor ya me ha quitado el asiento: la        // partida que se está pintando ya no es la mía y todos sus botones van a
+        // ser rechazados. Sin esto, el cliente se queda mirando una mesa muerta sin
+      // salida, porque no hay ningún botón de "salir" en la partida. Se vuelve
+      // al login, que es donde se puede volver a entrar.
+      //
+      // Se compara con `socket.id` y no con el estado `mySid` porque este
+      // listener se registra una vez (deps []) y cualquier `mySid` capturado
+      // aquí se quedaría en su valor inicial para siempre.
+      if (data.state === 'purgado' && data.sid === socket.id) {
+        alert(data.name
+          ? `Se ha liberado tu asiento (${data.name} dejó de responder). Vuelve a entrar para seguir jugando.`
+          : 'Se ha liberado tu asiento. Vuelve a entrar para seguir jugando.')
+        lastJoin.current = null
+        setInGame(false)
+        setView('login')
+      }
     })
 
     // `presence_challenge` es el reto explícito: "si estás ahí, contesta". Se

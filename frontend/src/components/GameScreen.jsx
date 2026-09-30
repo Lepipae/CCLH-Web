@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
+import { AnimatePresence } from 'framer-motion'
 import { Copy, Sparkles, X, Volume2, VolumeX } from 'lucide-react'
 import Leaderboard from './Leaderboard'
 import PlayersBanner from './PlayersBanner'
@@ -245,7 +245,7 @@ export default function GameScreen({ gameState, mySid, socket, presencia = {}, a
                 
                 <div className="played-cards">
                   <AnimatePresence>
-                    {played_cards.map((pc, i) => (
+                    {played_cards.map((pc) => (
                       <div 
                         key={pc.id} 
                         className={`card-stack ${!pc.revealed && state === 'judging' ? 'face-down' : ''}`}
@@ -341,7 +341,13 @@ export default function GameScreen({ gameState, mySid, socket, presencia = {}, a
                 <AnimatePresence mode="popLayout">
                   {hand.map((txt, idx) => (
                     <Card
-                      key={txt} // Usar solo el texto para que la key sea estable al desplazar índices
+                      // La key NO puede ser el texto: dos cartas iguales en la
+                      // misma mano (el mazo no garantiza que sean únicas) daban
+                      // dos elementos con la misma key, y React avisa y recyclea
+                      // el nodo equivocado al reorderar. El índice es lo único
+                      // único que hay aquí, porque al serializar la mano se
+                      // pierde el `card_id` que lleva la carta en el servidor.
+                      key={`${idx}:${txt}`}
                       text={txt}
                       type="white"
                       isPlayable={canPlay}

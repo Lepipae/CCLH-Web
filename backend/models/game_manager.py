@@ -2,21 +2,28 @@ import random
 import threading
 import time
 import uuid
-import json
 import os
 import logging
-import difflib
+from contextlib import contextmanager, ExitStack
 from models.room import Room
 from models.player import Player
-from models.outbox import Outbox, transactional
+from models.outbox import Outbox
 from models.presence import (PresencePolicy, contadores, VIVO, SOSPECHOSO,
                              PURGADO)
+from models.custom_cards import CustomCardsMixin
 
 # Logger del módulo: WARNING explícito (en vez de print) para deriva de cartas
 # y depuración de zombis, integrable con la telemetría del despliegue.
 logger = logging.getLogger(__name__)
 
-class GameManager:
+# Tope del mensaje de chat. El `maxlength` del input del cliente es una
+# comodidad, no una defensa: lo que llega por el socket se difunde a la mesa.
+MAX_CHAT = 500
+
+# Las cartas propias (alta, baja, import, export) viven en models/custom_cards.py.
+# Se mezclan aquí y no se delegan porque mutan el mazo global y los mazos de las
+# salas vivas: el GameManager es su dueño y su estado no se puede partir en dos.
+class GameManager(CustomCardsMixin):
     # --- Presencia: dos umbrales con nombre, no un número mágico ----------------
     # Un solo número no puede decir dos cosas a la vez, y aquí había que decir
     # las dos: cuándo hay motivo para sospechar de un cliente, y cuánto se le
@@ -47,6 +54,27 @@ class GameManager:
     # PRESENCE_GRACE_SECONDS, ROOM_SUSPECT_SECONDS, ROOM_GRACE_SECONDS). Un
     # valor inválido o negativo no impide el arranque: se usa el de por defecto.
     PRESENCE = PresencePolicy.from_env('PRESENCE', suspect_after=120, grace=180)
+
+    # La misma máquina para quien NUNCA ha contestado un latido. Antes esto no
+    # era una política sino un salto eterno: `heartbeat_pongs == 0` sacaba al
+    # jugador del juicio para siempre, con la idea de que si no sabe contestar
+    # es que no está ahí. El problema es que "no saber contestar" y "no estar"
+    # no son lo mismo, y quien no contesta nunca es justo el caso que hay que
+    # juzgar: un cliente con el JS de aplicación muerto (adblocker, hidratación
+    # fallida, bundle viejo en caché) mantiene el TRANSPORTE vivo, así que el
+    # `disconnect` de engine.io no llega nunca. Medido contra un servidor real:
+    # 25 clientes así llenaron MAX_ROOMS=20 y, tras 100 s y siete pasadas del
+    # reaper, las 20 seguían vivas y sin un solo aviso de presencia. El techo
+    # de salas era una irreversible sin salida.
+    #
+    # Los números son más largos que los de PRESENCE, no más cortos: cuanto
+    # menos evidencia hay, más margen se concede. Sospecha a los 240 s (16
+    # pasadas) y concede 300 s de gracia, de modo que quien vuelva dentro del
+    # plazo recupera el asiento igual que un jugador normal, y el aviso incluye
+    # el mismo `presence_challenge` de siempre. Lo que cambia es que el plazo
+    # existe: el peor caso de una sala fijada pasa de infinito a 9 minutos.
+    PRESENCE_SIN_PRUEBA = PresencePolicy.from_env('PRESENCE_SIN_PRUEBA',
+                                                  suspect_after=240, grace=300)
 
     # Techo de salas vivas por proceso. `join_game` acepta cualquier código de
     # sala que le manden, así que sin un tope cualquiera puede crear miles de
@@ -86,17 +114,39 @@ class GameManager:
         self.logger = logger
         self.global_white_cards = white_cards
         self.global_black_cards = black_cards
-        # Bajo async_mode='threading' los handlers corren en hilos reales y pueden
-        # intercalarse a mitad de una mutación (reparto de cartas, cambio de estado,
-        # import al mazo global...). Este cerrojo serializa TODAS las operaciones
-        # del juego: granularidad gruesa a propósito, la partida es por turnos y el
-        # coste es despreciable frente a la E/S de red. RLock (no Lock) porque hay
-        # reentradas legítimas: choose_winner -> send_room_update, etc.
-        self._lock = threading.RLock()
+        # Hay DOS cerrojos, y la diferencia entre ellos es el sentido del cambio:
+        #
+        # 1. `Room.lock` (en cada sala, models/room.py): el ESTADO DE JUEGO de una
+        #    mesa. Antes esto era un unico RLock global para todo el proceso, con
+        #    lo que una mesa con un cliente lento paraba a las demás y una pasada
+        #    del reaper con 41 salas retenía el cerrojo 245 ms. Ahora dos mesas
+        #    juegan en paralelo y el reaper no puede congelar la partida.
+        #
+        # 2. `self._registro_lock` (este): lo que NO es de una sala. El dict
+        #    `self.rooms` y las listas de cartas del mazo global. Se toma un
+        #    instante y se suelta: nunca alrededor de lógica de juego ni de E/S.
+        #
+        # 3. `self._contadores_lock` (este): un cerrojo HOJA para los contadores de
+        #    fases. Hoja significa que no espera a ningún otro cerrojo, así que
+        #    no participa en el orden de abajo y por eso puede tomarlo quien ya
+        #    tenga una sala (que es el caso normal: el reaper cuenta una
+        #    transición por mesa). Hace falta porque `d[k] += 1` no es atómico:
+        #    sin él, dos transiciones simultáneas se comerían una cuenta.
+        #
+        # EL ORDEN ENTRE ELLOS ES FIJO: registro ANTES que sala, nunca al revés.
+        # Es la condición para que no haya deadlock (un hilo con la sala A
+        # esperando el registro, y otro con el registro esperando la sala A).
+        # No es una convención: `_registro()` lo verifica y lanza RuntimeError si
+        # alguien lo incumple, porque un deadlock aquí es el servidor parado.
+        self._registro_lock = threading.RLock()
+        # Profundidad de cerrojos de sala que tiene el hilo AHORA MISMO. Vive en
+        # un thread-local porque la respuesta es por hilo: el hilo B puede estar
+        # con la sala A tomada sin que eso moleste al hilo A.
+        self._prof_salas = threading.local()
         # El cerrojo protege el ESTADO, nunca la E/S: los payloads se serializan
-        # con él tomado y se emiten al salir de la transacción (models/outbox.py).
-        # Es lo que evita que un cliente lento deje parado todo el servidor.
-        self._outbox = Outbox(self.socketio, self._lock)
+        # con el cerrojo tomado y se emiten al salir (models/outbox.py). El outbox
+        # ya no es dueño de ningún cerrojo de juego: solo encola y drena.
+        self._outbox = Outbox(self.socketio)
         # Contadores de fases de presencia. No sustituyen al log: dan el número
         # agregado sin tener que parsear líneas, que es lo que se quiere
         # responder a "¿cuánta gente se nos cae al día?".
@@ -105,68 +155,231 @@ class GameManager:
         # ataque, no de juego: si sube solo, alguien (o un cliente atascado en
         # un bucle) está probando códigos de sala.
         self.salas_rechazadas = 0
+        # Cerrojo hoja de los contadores. Ver el punto 3 del comentario de arriba.
+        self._contadores_lock = threading.Lock()
         self._start_room_reaper()
 
-    @transactional
-    def send_room_update(self, room_id):
-        # Se ejecuta dentro del cerrojo del llamador; solo lee estado y
-        # serializa una foto de la sala POR JUGADOR (Room.to_dict ya devuelve
-        # una copia de la mano, no la lista viva: entre que el payload se
-        # construye y que sale por el socket la mano puede haber cambiado).
-        # Los payloads se encolan y salen al salir del cerrojo.
+    # --- Cerrojos y transacciones -------------------------------------------
+
+    def _profundidad_de_salas(self):
+        """Cuántos cerrojos de sala tiene este hilo ahora mismo."""
+        return getattr(self._prof_salas, "n", 0)
+
+    @contextmanager
+    def _registro(self):
+        """Cerrojo del REGISTRO: el dict de salas, los contadores globales y las
+        listas de cartas del mazo global.
+
+        Prohibido tomarlo con un cerrojo de sala en la mano. Sería el deadlock
+        clásico: el hilo A tiene la sala y espera el registro, el hilo B tiene el
+        registro y espera la sala. Comprobado y no confiado: aquí un deadlock
+        sería el servidor entero parado, sin test que lo detecte a tiempo, así
+        que se falla ruidosamente en el sitio donde se introduce el error.
+        """
+        if self._profundidad_de_salas():
+            raise RuntimeError(
+                "se ha intentado tomar el cerrojo de registro con un cerrojo de "
+                f"sala tomado (profundidad {self._profundidad_de_salas()}): el "
+                "orden de cerrojos es registro -> sala, nunca al revés, o se "
+                "produce un deadlock")
+        with self._registro_lock:
+            yield
+
+    @contextmanager
+    def _sala(self, room):
+        """Cerrojo de UNA sala, y solo ella. Reentrante: las transacciones se
+        anidan con naturalidad (choose_winner -> send_room_update -> ...)."""
+        self._prof_salas.n = self._profundidad_de_salas() + 1
+        try:
+            with room.lock:
+                yield
+        finally:
+            self._prof_salas.n -= 1
+
+    @contextmanager
+    def _tx_sala(self, room_id, room=None):
+        """Transacción de una sala: toma SU cerrojo, ejecuta el cuerpo y drena
+        el lote de salida FUERA del cerrojo.
+
+        `room` se pasa cuando el llamante ya lo tiene resuelto (así se evita
+        buscarlo dos veces); si no, se busca aquí. Si la sala no existe se
+        entrega None y el cuerpo decide qué hacer: casi siempre, no hacer nada.
+        """
+        if room is None:
+            with self._registro():
+                room = self.rooms.get(room_id)
+        if room is None:
+            yield None
+            return
+        with self._sala(room):
+            with self._outbox.lote() as lote:
+                yield room
+        self._outbox.drenar(lote)
+
+    @contextmanager
+    def _tx_registro(self):
+        """Transacción que solo toca el registro (y las listas globales de
+        cartas). La usan las operaciones que no son de ninguna mesa: dar de alta
+        una carta propia, importar un set entero, avisar de que el servidor está
+        lleno. Lo que hacen con las salas vivas es tomarlas de una en una desde
+        aquí, con el orden bueno (registro -> sala)."""
+        with self._registro():
+            with self._outbox.lote() as lote:
+                yield lote
+        self._outbox.drenar(lote)
+
+    @contextmanager
+    def _tx_salas(self, *salas):
+        """Transacción sobre VARIAS salas a la vez, en un orden TOTAL y fijo:
+        por `room_id`. Es lo que hace falta para las operaciones que cruzan mesas
+        (unirse soltando la sala de origen, una desconexión que recorre todas).
+
+        El orden no es cosmético: si dos hilos cogieran las salas en orden
+        distinto (A->B y B->A) se quedarían esperando el uno al otro para
+        siempre. Ordenando por `room_id`, el orden de adquisición es el mismo en
+        todos los hilos y el deadlock es imposible por construcción. El cerrojo
+        de registro NO se puede tomar aquí (lo verifica `_registro`), así que
+        quien llame tiene que tener resuelto qué salas son antes, con el registro.
+        """
+        valves = ExitStack()
+        with valves:
+            for sala in sorted(salas, key=lambda r: r.room_id):
+                valves.enter_context(self._sala(sala))
+            with self._outbox.lote() as lote:
+                yield salas
+        self._outbox.drenar(lote)
+
+    def _salas_de(self, sid):
+        """Salas en las que `sid` tiene algún asiento (conectado o no). Solo el
+        registro, sin tomar el cerrojo de ninguna sala: es la lista de candidatas
+        que luego se bloquean y se comprueban ya con su cerrojo tomado."""
+        with self._registro():
+            return [room for room in self.rooms.values() if sid in room.players]
+
+    @contextmanager
+    def _sala_de_id(self, room_id):
+        """Cerrojo de la sala `room_id` SIN lote de salida. Para las lecturas
+        puras (las métricas), que no encolan nada y no quieren pagar un lote
+        vacío por sala. Entrega None si la sala ya no existe."""
+        with self._registro():
+            room = self.rooms.get(room_id)
+        if room is None:
+            yield None
+            return
+        with self._sala(room):
+            yield room
+
+    def _contar(self, ambito, fase, n=1):
+        """Suma `n` transiciones al contador de fases de `ambito` ('jugadores' o
+        'salas'). Cerrojo hoja: se puede llamar con una sala en la mano."""
+        with self._contadores_lock:
+            fases = self.presencia[ambito]
+            fases[fase] = fases.get(fase, 0) + n
+
+    def _contar_sala_rechazada(self):
+        """Contador de ataque: una sala rechazada por el techo. Va con cerrojo
+        propio y no con el del registro porque `/metrics` lo lee sin tomar el
+        registro (para no retener a las mesas)."""
+        with self._contadores_lock:
+            self.salas_rechazadas += 1
+
+    def send_room_update(self, room_id, _room=None):
+        # Reentrante: la llaman casi siempre desde DENTRO de la transacción de su
+        # propia sala (jugar, votar, revelar...), donde el cerrojo ya está
+        # tomado y el lote ya está abierto. Para eso está `_room`: quien ya lo
+        # tiene se lo pasa, porque volver a buscar la sala en el registro sería
+        # tomar el registro con una sala en la mano, que es exactamente el orden
+        # que deadlockea (y `_registro()` lo hace saltar). Cuando llega de fuera
+        # (el reaper, o un test) lo resuelve ella y abre su propia transacción.
+        # En ambos casos solo lee estado y serializa una foto de la sala POR
+        # JUGADOR (Room.to_dict ya devuelve una copia de la mano, no la lista
+        # viva: entre que el payload se construye y que sale por el socket la
+        # mano puede haber cambiado).
         #
         # IMPORTANTE: emitir NO renueva `last_seen`. Escribir en el búfer de
         # salida no demuestra que el cliente siga ahí, y hacerlo convertía el
         # umbral de zombis en un detector de "sala silenciosa" (mataba a todo
         # el mundo a la vez) mientras un solo jugador hablando resucitaba a los
         # muertos. La señal de vida llega por `heartbeat` (pong del cliente).
-        room = self.rooms.get(room_id)
-        if room is None:
-            return
-        for sid, p in room.players.items():
-            if p.is_connected:
-                self._outbox.add_update(room_id, sid, room.to_dict(for_sid=sid))
+        with self._tx_sala(room_id, room=_room) as room:
+            if room is None:
+                return
+            for sid, p in room.players.items():
+                if p.is_connected:
+                    self._outbox.add_update(room_id, sid, room.to_dict(for_sid=sid))
 
-    @transactional
-    def send_chat_system(self, room_id, message):
-        self._outbox.add_direct(room_id, 'chat_message', {'msg': message, 'system': True}, to=room_id)
+    def send_chat_system(self, room_id, message, _room=None):
+        with self._tx_sala(room_id, room=_room) as room:
+            if room is None:
+                return
+            self._outbox.add_direct(room_id, 'chat_message',
+                                    {'msg': message, 'system': True}, to=room_id)
 
-    @transactional
     def join_game(self, sid, name, room_id):
-        return self._join_game_locked(sid, name, room_id)
+        """Da de alta a `sid` en `room_id`.
 
-    def _join_game_locked(self, sid, name, room_id):
-        if room_id in self.rooms:
-            # Check duplicates
-            for existing_sid, p in self.rooms[room_id].players.items():
-                if p.name == name and p.is_connected and existing_sid != sid:
-                    self._outbox.add_direct(room_id, 'join_error',
-                                            {'message': 'Ese nombre ya está en uso en esta sala.'}, to=sid)
-                    return False
+        Es la operación más larga de todas: toca el REGISTRO (puede crear la sala,
+        comprobar el techo e incrementar el contador de rechazo) y luego la SALA, y
+        además puede tener que soltar al jugador de la sala en la que estuviera.
+        Por eso es la única que necesita bloqueos de dos niveles, y por eso los
+        toma en el orden que no puede deadlockear: registro, y después las salas
+        por `room_id` (ver `_tx_salas`).
 
-        if room_id not in self.rooms:
+        Lo que NO se puede hacer desde dentro de una sala es tocar el registro, y
+        lo que no se puede hacer desde el registro es decidir nada de juego: por
+        eso el registro solo resuelve NOMBRES de salas, y la verdad vive ya en la
+        siguiente fase, con los cerrojos de sala tomados. Tampoco se emite nada
+        con el registro tomado: el `join_error` del servidor lleno sale por una
+        transacción de registro, ya fuera de su cerrojo.
+        """
+        # --- Fase 1: registro. Solo resolución y creación; nada de juego. ---
+        with self._registro():
+            room = self.rooms.get(room_id)
             # Techo de salas. Va ANTES de crear nada: una sala rechazada no
-            # ocupa memoria ni aparece en el `game_update` de nadie. Solo
-            # crear sala nueva cuenta; entrar en una que ya existe nunca se
-            # rechaza por esto, porque no crea nada nuevo.
-            if len(self.rooms) >= self.MAX_ROOMS:
-                self.salas_rechazadas += 1
+            # ocupa memoria ni aparece en el `game_update` de nadie. Solo crear
+            # sala nueva cuenta; entrar en una que ya existe nunca se rechaza por
+            # esto, porque no crea nada nuevo.
+            lleno = room is None and len(self.rooms) >= self.MAX_ROOMS
+            if lleno:
+                self._contar_sala_rechazada()
                 logger.warning(
                     "Sala '%s' rechazada: el proceso ya tiene %d salas (MAX_ROOMS)",
                     room_id, len(self.rooms))
+                origenes = []
+            else:
+                if room is None:
+                    room = self.rooms[room_id] = Room(
+                        room_id, sid, self.global_white_cards, self.global_black_cards)
+                # Las salas donde este sid ya tiene un asiento: hay que soltarlas
+                # ANTES de tomar el nuevo asiento (si no, quedaba un Player
+                # fantasma 'conectado' en la sala anterior).
+                origenes = [r for r in self._salas_de(sid) if r is not room]
+
+        if lleno:
+            with self._tx_registro():
                 self._outbox.add_direct(room_id, 'join_error', {
                     'message': 'El servidor está lleno de salas ahora mismo. '
                                'Prueba con otro código en un momento.'}, to=sid)
-                return False
-            self.rooms[room_id] = Room(room_id, sid, self.global_white_cards, self.global_black_cards)
+            return False
 
-        room = self.rooms[room_id]
+        # --- Fase 2: las salas, en orden total por room_id. ---
+        with self._tx_salas(*([room] + origenes)):
+            return self._join_game(sid, name, room_id, room, origenes)
+
+    def _join_game(self, sid, name, room_id, room, origenes):
+        # --- Check duplicates
+        for existing_sid, p in room.players.items():
+            if p.name == name and p.is_connected and existing_sid != sid:
+                self._outbox.add_direct(room_id, 'join_error',
+                                        {'message': 'Ese nombre ya está en uso en esta sala.'}, to=sid)
+                return False
+
         # Asignar None a `empty_since` es "aquí hay alguien": perdona la
         # sospecha de la sala y cancela su periodo de gracia, de modo que quien
         # vuelve antes de que venza recupera la partida tal cual la dejó. Se
         # comprueba el estado ANTES porque el setter no devuelve nada.
         if room.presence.state == SOSPECHOSO:
-            self.presencia['salas'][VIVO] += 1
+            self._contar('salas', VIVO)
         room.empty_since = None
 
         # Un sid, un asiento. Si venía jugando en otra sala, se suelta de ella
@@ -174,12 +387,32 @@ class GameManager:
         # 'conectado' en la sala anterior y la purga de zombis lo expulsaba
         # también de ésta. Va después del chequeo de nombre duplicado para no
         # tocar la sala de origen si la unión va a ser rechazada.
-        self._release_other_rooms(sid, room_id)
+        #
+        # `origenes` ya viene resuelto y con su cerrojo tomado: volver a buscarlo
+        # aquí tocaría el registro con una sala en la mano, que es exactamente el
+        # orden que produce el deadlock.
+        for otra in origenes:
+            if sid in otra.players:
+                self._release_from_room(otra, otra.room_id, sid)
 
         reconnected = False
         for existing_sid, p in list(room.players.items()):
-            if p.name == name:
+            if p.name == name or existing_sid == sid:
+                # Dos maneras de reconocer al mismo jugador: por el nombre (ha
+                # vuelto con otro sid) o por el sid (sigue en la mesa y lo que ha
+                # cambiado es el nombre que ha escrito). La segunda no se puede
+                # tratar como "nuevo jugador": antes caía en el `else` de abajo y
+                # creaba un Player nuevo encima del viejo, lo que perdía su mano
+                # y su marcador PARA SIEMPRE (las cartas del Player viejo no
+                # estaban en ninguna parte y el mazo no las volría a ver). Aquí se
+                # conserva el asiento y solo se actualiza el nombre.
+                #
+                # El chequeo de nombre duplicado de arriba ya ha descartado que ese
+                # nombre sea de OTRO jugador conectado, así que renombrarse no
+                # puede pisar a nadie.
+                nombre_anterior = p.name
                 p.sid = sid
+                p.name = name
                 p.is_connected = True
                 room.players[sid] = p
                 if existing_sid != sid:
@@ -196,6 +429,8 @@ class GameManager:
                         room.join_order[idx] = sid
                     except ValueError:
                         room.join_order.append(sid)
+                elif nombre_anterior != name:
+                    print(f"{nombre_anterior} ahora se llama {name} en {room_id}")
                 reconnected = True
                 break
                 
@@ -210,28 +445,33 @@ class GameManager:
 
         print(f"{name} se unió a {room_id}")
         # Un join exitoso es tráfico real del cliente: renueva su last_seen
-        # (pero no cuenta como prueba de latido; ver _touch_player)
-        self._touch_player(sid)
-        self.send_room_update(room_id)
+        # (pero no cuenta como prueba de latido; ver _touch_player). Se le pasa
+        # la sala porque su cerrojo ya está tomado y `_touch_player` no puede
+        # volver a buscar en el registro con una sala en la mano.
+        self._touch_player(sid, _salas_previas=[room])
+        self.send_room_update(room_id, _room=room)
         return True
 
-    @transactional
     def heartbeat(self, sid):
         """Punto de entrada público del latido: el cliente ha contestado al
         'heartbeat_ping' del reaper. Es la prueba de que ese cliente habla el
         protocolo de latidos, que es lo que autoriza al reaper a purgarlo si
         luego deja de contestar. Unir a la sala no cuenta: demostrar que sabes
-        contestar es justo lo que hay que comprobar."""
+        contestar es justo lo que hay que comprobar.
+
+        Cruza salas: el mismo sid puede tener un asiento en más de una mientras
+        se resuelve la desconexión, así que se bloquean todas las suyas (por
+        `room_id`) antes de tocar nada."""
         self._touch_player(sid, proof_of_life=True)
 
-    def _touch_player(self, sid, proof_of_life=False):
+    def _touch_player(self, sid, proof_of_life=False, _salas_previas=None):
         """Renueva el reloj de silencio del jugador `sid` en todas las salas donde
         aparezca, y le perdona la sospecha si estaba en periodo de gracia.
         `proof_of_life=True` además incrementa su contador de latidos
         respondidos. Nunca se llama desde una difusión del servidor: solo desde
         unión o pong, es decir, algo que demuestra que hubo tráfico de verdad.
-        Se invoca SIEMPRE bajo self._lock (RLock de la sala/GM), igual que el
-        reaper, para que la lectura/escritura del estado no se intercale con
+        Se invoca SIEMPRE con el cerrojo de las salas de `sid` tomado, igual que
+        el reaper, para que la lectura/escritura del estado no se intercale con
         los handlers de juego.
 
         El perdón es lo que convierte la sospecha en periodo de gracia real: un
@@ -241,20 +481,34 @@ class GameManager:
 
         Nota: como el reaper hace ping cada ROOM_REAP_INTERVAL s, en la
         práctica el reloj es "último pong" y cualquier cliente vivo lo
-        renueva solo; las acciones de juego no necesitan tocarlo."""
-        now = time.time()
-        for room in self.rooms.values():
-            p = room.players.get(sid)
-            if p is not None:
-                if proof_of_life:
-                    p.heartbeat_pongs += 1
-                # `signal` renueva el reloj y, si estaba sospechoso, lo devuelve
-                # a vivo. Se avisa a la sala de esa vuelta: sin este anuncio el
-                # cliente se queda con el cartel de "se ha ido" sobre alguien que
-                # está delante de la pantalla.
-                if p.presence.signal(now):
-                    self._anunciar_presencia(room, sid, VIVO, now,
-                                             motivo='ha vuelto a dar señales de vida')
+        renueva solo; las acciones de juego no necesitan tocarlo.
+
+        `_salas_previas` permite saltarse la búsqueda cuando quien llama ya sabe
+        qué salas bloquear (así lo hace `join_game`, que viene con las suyas ya
+        resueltas y no puede volver a tocar el registro con una sala tomada)."""
+        if _salas_previas is None:
+            salas = self._salas_de(sid)
+        else:
+            salas = [s for s in _salas_previas if s is not None]
+        if not salas:
+            return
+        with self._tx_salas(*salas):
+            now = time.time()
+            for room in salas:
+                # Solo los asientos activos: un pong de un asiento ya purgado no
+                # renueva nada, porque ese jugador dejó de mandar hace rato y lo
+                # que debe hacer es volver a entrar por `join_game`.
+                p = room.asiento(sid)
+                if p is not None:
+                    if proof_of_life:
+                        p.heartbeat_pongs += 1
+                    # `signal` renueva el reloj y, si estaba sospechoso, lo devuelve
+                    # a vivo. Se avisa a la sala de esa vuelta: sin este anuncio el
+                    # cliente se queda con el cartel de "se ha ido" sobre alguien que
+                    # está delante de la pantalla.
+                    if p.presence.signal(now):
+                        self._anunciar_presencia(room, sid, VIVO, now,
+                                                 motivo='ha vuelto a dar señales de vida')
 
     def room_of(self, sid):
         """Sala en la que `sid` tiene asiento activo, o None. Se deriva de la
@@ -262,16 +516,19 @@ class GameManager:
         aparte que pueda desincronizarse. La usa app.py para abandonar la sala
         anterior de Socket.IO antes de entrar en la nueva.
 
+        Es una consulta de LECTURA: no modifica nada, así que no necesita el
+        cerrojo de ninguna sala. Solo el del registro, un instante, para que el
+        recorrido del dict sea coherente mientras el reaper borra salas.
+
         Si quedara un asiento desconectado con el mismo sid (un fantasma), se
         ignora: lo que interesa es dónde está el jugador de verdad."""
         fallback = None
-        for room_id, room in self.rooms.items():
-            p = room.players.get(sid)
-            if p is None:
-                continue
-            if p.is_connected:
-                return room_id
-            fallback = room_id
+        with self._registro():
+            for room_id, room in self.rooms.items():
+                if room.asiento(sid) is not None:
+                    return room_id
+                if room.players.get(sid) is not None:
+                    fallback = room_id
         return fallback
 
     def _heal_stale_roles(self, room):
@@ -291,37 +548,41 @@ class GameManager:
         czar_p = room.players.get(room.czar)
         if room.czar and (czar_p is None or not czar_p.is_connected):
             if room.state == 'round_end':
-                self.advance_to_next_round(room.room_id)
+                self.advance_to_next_round(room.room_id, room)
             else:
                 self._reassign_czar_after_disconnect(room)
 
-    @transactional
     def disconnect(self, sid):
-        self._disconnect_locked(sid)
+        """Desconexión formal de `sid`.
 
-    def _disconnect_locked(self, sid):
-        for room_id, room in self.rooms.items():
-            if sid in room.players:
-                self._release_from_room(room, room_id, sid)
+        Cruza salas: el mismo sid puede tener un asiento en más de una mientras
+        se resuelve una migración, así que se localizan sus salas (solo
+        registro, sin tomar ninguna) y se bloquean todas a la vez, en el orden
+        total de `_tx_salas`. No se recorren una a una porque `_release_from_room`
+        necesita el registro para el `send_room_update` de quien se queda, y
+        tomarlo ya con el cerrojo de una mesa sería el deadlock prohibido.
 
-    def _release_other_rooms(self, sid, keep_room_id):
-        """Suelta a `sid` de cualquier sala que no sea `keep_room_id`.
-
-        Un sid tiene como mucho un asiento. Sin esto, moverse de una sala a
-        otra dejaba un Player fantasma en la anterior que seguía marcado como
-        conectado: el reaper lo daba por zombi y, al purgarlo con
-        _disconnect_locked (que recorre todas las salas), le cortaba la sesión
-        en la sala nueva donde sí estaba jugando. Reutilizar la misma rutina
-        que una desconexión real también sanea la sala abandonada: relevo de
-        líder/juez, revert a 'waiting' y activación de espectadores."""
-        for room_id, room in self.rooms.items():
-            if room_id != keep_room_id and sid in room.players:
-                self._release_from_room(room, room_id, sid)
+        Un sid tiene como mucho un asiento. Sin esto, moverse de una sala a otra
+        dejaba un Player fantasma en la anterior que seguía marcado como
+        conectado: el reaper lo daba por zombi y, al purgarlo, le cortaba la
+        sesión en la sala nueva donde sí estaba jugando.        Por eso `join_game` reutiliza esta misma rutina con la sala de origen ya
+        resuelta y bloqueada.
+        """
+        salas = self._salas_de(sid)
+        if not salas:
+            return
+        with self._tx_salas(*salas):
+            for room in salas:
+                self._release_from_room(room, room.room_id, sid)
 
     def _release_from_room(self, room, room_id, sid):
         """Marca a `sid` como desconectado de `room` y deja la sala en un estado
-        coherente. Es el cuerpo compartido por la desconexión formal
-        (`disconnect`) y por el abandono de sala al migrar (`_release_other_rooms`)."""
+        coherente. Se llama SIEMPRE con el cerrojo de `room` tomado: es el cuerpo
+        compartido por la desconexión formal (`disconnect`) y por la purga de un
+        zombi (`_reap_jugadores_de_sala`), que son las dos cosas que hacen lo
+        mismo con un asiento. Reutilizar la misma rutina también sanea la sala
+        abandonada: relevo de líder/juez, revert a 'waiting' y activación de
+        espectadores."""
         room.remove_player(sid)
         active = room.get_active_players()
         if active:
@@ -343,7 +604,7 @@ class GameManager:
                         random.shuffle(room.played_cards)
                 if room.state != 'waiting':
                     self.check_and_execute_renew(room)
-            self.send_room_update(room_id)
+            self.send_room_update(room_id, _room=room)
         else:
             # Sala vacía: se marca el momento y el reaper la borrará si nadie vuelve
             room.empty_since = time.time()
@@ -387,7 +648,7 @@ class GameManager:
         if room.state == 'round_end':
             # El recuento ya está cerrado: se avanza la ronda directamente
             # (el auto-avance pendiente quedará obsoleto: comprueba el czar antiguo)
-            self.advance_to_next_round(room.room_id)
+            self.advance_to_next_round(room.room_id, room)
             return
         self._rotate_czar_from(room, room.czar)
 
@@ -475,11 +736,19 @@ class GameManager:
                 print("Error en el reaper de salas:", e)
             self.socketio.sleep(self.ROOM_REAP_INTERVAL)
 
-    @transactional
     def reap_empty_rooms(self):
-        """Pasada periódica del reaper (ciclo de ~ROOM_REAP_INTERVAL s), bajo el
-        RLock global: pide un latido a cada cliente conectado y hace avanzar las
-        máquinas de presencia (jugadores y salas) un paso.
+        """Pasada periódica del reaper (ciclo de ~ROOM_REAP_INTERVAL s): pide un
+        latido a cada cliente conectado y hace avanzar las máquinas de presencia
+        (jugadores y salas) un paso.
+
+        UNA PASADA INDEPENDIENTE POR MESA. Antes esto era una única transacción
+        con el cerrojo global encima, lo que tenía dos costes que no se ven
+        hasta que duelen: una mesa con un cliente lento paraba a las otras
+        cuarenta, y corregir una mesa exigía retener el estado de todas. Ahora el
+        registro se lee una vez (una lista de ids, un instante) y después cada
+        sala se abre y se cierra por separado, con SU cerrojo. Que las salas se
+        purguen en un orden distinto al de la lista solo cambia el orden de los
+        avisos, no el resultado: nadie se purga antes por ir el segundo.
 
         Ninguna purga ocurre en la pasada en la que se detecta el silencio: se
         sospecha primero y la purga espera a la pasada siguiente. Es la
@@ -488,10 +757,11 @@ class GameManager:
         cobertura mala o un móvil que acaba de cambiar de red, y en ninguno de
         esos casos la respuesta correcta es echar a alguien.
 
-        Los latidos salen al terminar la pasada, no durante: son uno por
-        jugador conectado y son la E/S más barata de todas (una línea), pero se
-        emiten a un socket INDIVIDUAL y con 41 salas y 49 conectados eran 245
-        ms de cerrojo global quemados en mensajes de tres campos.
+        Los latidos salen al terminar la transacción de cada mesa, no durante:
+        son uno por jugador conectado y son la E/S más barata de todas (una
+        línea), pero se emiten a un socket INDIVIDUAL y con 41 salas y 49
+        conectados eran 245 ms de cerrojo global quemados en mensajes de tres
+        campos.
 
         Aquí ya no se audita la conservación de cartas: esa comprobación vive en
         la suite de tests, que la corre después de cada acción. En producción
@@ -499,22 +769,51 @@ class GameManager:
         qué ni cuándo, y obligaba a recorrer el estado entero de cada sala cada
         15 s bajo el cerrojo global."""
         now = time.time()
+        # El registro se lee UNA vez y se suelta: solo la lista de ids. A partir
+        # de aquí cada mesa va por su cuenta, y ninguna operación de la pasada
+        # vuelve a necesitar el registro (el borrado sí, y va al final).
+        with self._registro():
+            room_ids = list(self.rooms)
 
-        # --- Latido: la única forma de renovar el reloj de silencio es que el
-        # cliente conteste. Se emite a TODOS los conectados (también a los que
-        # aún no han contestado nunca, y también a los que están en periodo de
-        # gracia: es justo a ellos a quien hay que poder grabarle la prueba de
-        # vida) para que puedan demostrar que viven. Es la contrapartida de la
-        # purga: no podemos exigirle a nadie que responda a un ping que no le
-        # hemos hecho.
-        for room in self.rooms.values():
-            for sid, p in room.players.items():
-                if p.is_connected:
-                    self._outbox.add_direct(room.room_id, 'heartbeat_ping',
-                                            {'room_id': room.room_id}, to=sid)
+        purgadas = []
+        for room_id in room_ids:
+            with self._tx_sala(room_id) as room:
+                # La sala puede haber desaparecido entre la foto y ahora (la
+                # borra otra pasada): no hay nada que hacer con ella.
+                if room is None:
+                    continue
 
-        self._reap_jugadores(now)
-        self._reap_salas(now)
+                # --- Latido: la única forma de renovar el reloj de silencio es
+                # que el cliente conteste. Se emite a TODOS los conectados
+                # (también a los que aún no han contestado nunca, y también a
+                # los que están en periodo de gracia: es justo a ellos a quien
+                # hay que poder grabarle la prueba de vida) para que puedan
+                # demostrar que viven. Es la contrapartida de la purga: no
+                # podemos exigirle a nadie que responda a un ping que no le
+                # hemos hecho.
+                for sid, p in list(room.players.items()):
+                    if p.is_connected:
+                        self._outbox.add_direct(room_id, 'heartbeat_ping',
+                                                {'room_id': room_id}, to=sid)
+
+                self._reap_jugadores_de_sala(room, now)
+                if self._reap_sala(room, now):
+                    purgadas.append(room_id)
+
+        # El BORRADO es lo único de la pasada que necesita el registro, y va al
+        # final, con todas las salas ya sueltas. Entrar al registro con una sala
+        # en la mano es el orden que produce el deadlock, y una mesa no puede
+        # quedarse congelada porque haya que purgar otra.
+        if purgadas:
+            por_sacar = []
+            with self._registro():
+                for room_id in purgadas:
+                    por_sacar += self._borrar_sala_purgada(room_id, now)
+            # FUERA del registro (y de cualquier cerrojo): sacar a alguien de
+            # una sala de Socket.IO toca el estado de ese servidor y, en otras
+            # versiones de la librería, escribe al socket. La E/S no se hace con
+            # un cerrojo de juego tomado, y esta regla no se negocia.
+            self._sacar_del_socket_io(por_sacar)
 
     # --- Presencia: las dos fases --------------------------------------------
 
@@ -533,7 +832,10 @@ class GameManager:
           mismo `heartbeat_pong` que ya conoce.
 
         Se encolan por la caja de salida como todo lo demás: la E/S sale fuera
-        del cerrojo global aunque haya 41 salas y 49 conectados."""
+        del cerrojo de la sala aunque haya 41 mesas y 49 conectados. Se llama
+        con ese cerrojo tomado (lo tienen `_touch_player` y el reaper), y por
+        eso el contador de la transición va con su cerrojo hoja y no con el del
+        registro: tomarlo aquí sería tomarlo al revés."""
         p = room.players[sid]
         presencia = p.presence
         aviso = {
@@ -569,13 +871,13 @@ class GameManager:
             }
             self._outbox.add_direct(room.room_id, 'presence_challenge', reto, to=sid)
 
-        self.presencia['jugadores'][estado] = \
-            self.presencia['jugadores'].get(estado, 0) + 1
+        self._contar('jugadores', estado)
         logger.info("Presencia: %s pasa a '%s' en la sala %s (%s)", p.name, estado,
                     room.room_id, motivo)
 
-    def _reap_jugadores(self, now):
-        """Un paso de la máquina de presencia de cada jugador conectado.
+    def _reap_jugadores_de_sala(self, room, now):
+        """Un paso de la máquina de presencia de los jugadores de UNA sala, con
+        su cerrojo tomado y sin tocar el registro.
 
         Se separa en dos listas porque las transiciones no tocan el estado de
         la sala y hay que recorrerla entera antes de liberar a nadie: purgar
@@ -584,13 +886,12 @@ class GameManager:
 
         Reglas:
 
-        - `heartbeat_pongs > 0` es la condición previa. Solo se juzga a quien ya
-          demostró que sabe contestar un latido, así que su silencio posterior
-          es prueba y no "el jugador está leyendo sin tocar nada". Un cliente
-          que nunca ha contestado (build antiguo en caché, JS bloqueado) no se
-          toca jamás: para él no tenemos evidencia, y a esos casos los cubre el
-          ping/pong interno de engine.io, que dispara 'disconnect' en <=45 s.
-        -        Sospechar y purgar son mutuamente excluyentes en la misma pasada
+        - Nadie queda sin juicio. La evidencia decide QUÉ política se aplica,
+          no si se aplica: quien ya contestó alguna vez se juzga con PRESENCE, y
+          quien nunca contestó se juzga con PRESENCE_SIN_PRUEBA, que es la misma
+          máquina con más margen. Saltarse a quien no ha dado pruebas era lo que
+          dejaba fijar salas para siempre (ver PRESENCE_SIN_PRUEBA).
+        - Sospechar y purgar son mutuamente excluyentes en la misma pasada
           (`elif`): aunque la gracia valga 0, nadie se expulsa a quien no se le
           ha avisado antes. En la práctica la purga necesita como mínimo dos
           pasadas, y con ROOM_REAP_INTERVAL = 15 s y una gracia de 180 s son
@@ -604,26 +905,34 @@ class GameManager:
           asiento de otra sala no es de su incumbencia.
         """
         sospechosos, a_purgar = [], []
-        for room in self.rooms.values():
-            for sid, p in room.players.items():
-                if not p.is_connected or p.heartbeat_pongs == 0:
-                    continue
-                if p.presence.accuse(now, self.PRESENCE):
-                    sospechosos.append((room, sid, p))
-                elif p.presence.purge_due(now):
-                    a_purgar.append((room, sid, p))
+        for sid, p in list(room.players.items()):
+            if not p.is_connected:
+                continue
+            # La prueba decide la política, no la aplicabilidad: sin pruebas se
+            # juzga igual, pero con plazos más largos.
+            politica = (self.PRESENCE if p.heartbeat_pongs
+                        else self.PRESENCE_SIN_PRUEBA)
+            if p.presence.accuse(now, politica):
+                sospechosos.append((sid, p))
+            elif p.presence.purge_due(now):
+                a_purgar.append((sid, p))
 
-        for room, sid, p in sospechosos:
+        for sid, p in sospechosos:
             # El motivo lleva el dato que hace falta al leer el log sin más
             # contexto: cuánto lleva callado y cuánto le queda de gracia.
-            self._anunciar_presencia(
-                room, sid, SOSPECHOSO, now,
-                motivo="silencio de {:.0f}s tras {} pongs; si no vuelve, su "
-                       "asiento se libera en {:.0f}s".format(
-                           now - p.last_seen, p.heartbeat_pongs,
-                           p.presence.segundos_para_purga(now)))
+            if p.heartbeat_pongs:
+                motivo = ("silencio de {:.0f}s tras {} pongs; si no vuelve, su "
+                          "asiento se libera en {:.0f}s".format(
+                              now - p.last_seen, p.heartbeat_pongs,
+                              p.presence.segundos_para_purga(now)))
+            else:
+                motivo = ("nunca ha contestado un solo latido en {:.0f}s; si no "
+                          "contesta al reto, su asiento se libera en {:.0f}s".format(
+                              now - p.last_seen,
+                              p.presence.segundos_para_purga(now)))
+            self._anunciar_presencia(room, sid, SOSPECHOSO, now, motivo=motivo)
 
-        for room, sid, p in a_purgar:
+        for sid, p in a_purgar:
             # El aviso va antes de marcar PURGADO: así conserva el plazo que
             # acaba de cumplirse, que es la información útil para el resto.
             self._anunciar_presencia(
@@ -634,8 +943,11 @@ class GameManager:
             p.presence.purge(now)
             self._release_from_room(room, room.room_id, sid)
 
-    def _reap_salas(self, now):
-        """Un paso de la máquina de presencia de cada sala.
+    def _reap_sala(self, room, now):
+        """Un paso de la máquina de presencia de UNA sala. Devuelve True si su
+        gracia se ha agotado y toca purgarla; el BORRADO no se hace aquí (es del
+        registro) sino en `_borrar_sala_purgada`, ya con el cerrojo de la sala
+        suelto.
 
         La sala vive mientras tenga alguien conectado; al quedarse vacía arranca
         su reloj de silencio y pasa por las mismas dos fases que un jugador. No
@@ -652,57 +964,223 @@ class GameManager:
         es también la que hace inofensivo `join_game` con códigos inventados:
         crear y salir no puede acumular salas indefinidamente.
         """
-        purgadas = []
-        for room_id, room in list(self.rooms.items()):
-            if room.empty_since is None:
-                # Alguien ha entrado: el setter de `empty_since` ya le ha
-                # indultado y ha devuelto la sala a vivo. Solo queda contarlo.
-                if room.presence.state != VIVO:
-                    self.presencia['salas'][VIVO] += 1
-                continue
-            politica = (self.ROOM_LIFECYCLE if room.ha_empezado
-                        else self.ROOM_LIFECYCLE_NUEVA)
-            if room.presence.accuse(now, politica):
-                self.presencia['salas'][SOSPECHOSO] += 1
-                logger.info(
-                    "Reaper: la sala %s lleva %.0fs vacía; se purga en %.0fs si "
-                    "no vuelve nadie%s", room_id, now - room.empty_since,
-                    room.presence.segundos_para_purga(now),
-                    "" if room.ha_empezado else " (nunca llegó a empezar)")
-            elif room.presence.purge_due(now):
-                purgadas.append(room_id)
+        if room.empty_since is None:
+            # Alguien ha entrado: el setter de `empty_since` ya le ha indultado
+            # y ha devuelto la sala a vivo. Solo queda contarlo.
+            if room.presence.state != VIVO:
+                self._contar('salas', VIVO)
+            return False
+        politica = (self.ROOM_LIFECYCLE if room.ha_empezado
+                    else self.ROOM_LIFECYCLE_NUEVA)
+        if room.presence.accuse(now, politica):
+            self._contar('salas', SOSPECHOSO)
+            logger.info(
+                "Reaper: la sala %s lleva %.0fs vacía; se purga en %.0fs si "
+                "no vuelve nadie%s", room.room_id, now - room.empty_since,
+                room.presence.segundos_para_purga(now),
+                "" if room.ha_empezado else " (nunca llegó a empezar)")
+            return False
+        return room.presence.purge_due(now)
 
-        for room_id in purgadas:
-            sala = self.rooms[room_id]
+    def _borrar_sala_purgada(self, room_id, now):
+        """Purga terminal de una sala cuya gracia se agotó. La llama el reaper con
+        el REGISTRO tomado y sin ningún cerrojo de sala, y hace las dos cosas en
+        el orden correcto: el estado de la mesa se toca con su cerrojo (y con el
+        registro ya encima, que es el orden bueno), y el borrado del dict, que es
+        del registro, va al final.
+
+        Devuelve los `(room_id, sid)` que hay que sacar de la sala de
+        Socket.IO: la sala del GameManager y la de Socket.IO no son lo mismo."""
+        sala = self.rooms.get(room_id)
+        if sala is None:
+            return []
+        with self._sala(sala):
             logger.info("Reaper: sala %s purgada tras %.0fs vacía (gracia "
                         "agotada%s)", room_id, now - sala.empty_since,
                         "" if sala.ha_empezado else ", sin llegar a empezar")
-            self.presencia['salas'][PURGADO] += 1
+            self._contar('salas', PURGADO)
             sala.presence.purge(now)
-            self._delete_room(room_id)
+        return self._delete_room(room_id)
+
+    def _sacar_del_socket_io(self, pares):
+        """Saca a los clientes de la sala de Socket.IO de una mesa ya purgada.
+
+        app.py mete a cada cliente en una sala de Socket.IO con su código de
+        sala, y solo se sale de ella al cambiar de sala (o al desconectarse, que
+        lo hace la propia librería). Un cliente purgado por el reaper, o que se
+        fue del juego sin que llegara su 'disconnect', sigue conectado y sigue
+        dentro: si más adelante alguien crea una mesa con el MISMO código, ese
+        cliente invisible se seguiría enterando de su chat.
+
+        Se llama FUERA de los cerrojos y a través del servidor de la librería
+        (no del `leave_room` de flask_socketio, que necesita un contexto de
+        petición y aquí no hay: esto corre en el hilo del reaper)."""
+        servidor = getattr(self.socketio, 'server', None)
+        if servidor is None:      # socket de mentira (tests, banco): nada que sacar
+            return
+        for room_id, sid in pares:
+            try:
+                servidor.leave_room(sid, room_id)
+            except Exception as e:
+                # Un socket que ya no está no se puede sacar de ninguna sala.
+                # Es lo más normal del mundo con el reaper de por medio.
+                logger.debug("No se pudo sacar a %s de la sala %s: %s", sid, room_id, e)
 
     def _delete_room(self, room_id):
-        room = self.rooms.pop(room_id, None)
+        """Saca la sala del registro y olvida su estado. Se llama con el
+        registro tomado; su cerrojo se toma DESPUÉS de sacarla del dict, con la
+        sala ya descolgada, para no competir con ningún hilo que la tuviera
+        resuelta antes. Devuelve los sids que tenía, para que el llamante pueda
+        sacarlos de la sala de Socket.IO."""
+        with self._registro():
+            room = self.rooms.pop(room_id, None)
         if not room:
-            return
+            return []
+        sids = list(room.players)
         # El estado de emisión se olvida con la sala: sus canales no se
         # reutilizan y lo que otro hilo tenga en la mano se descarta al drenar.
         self._outbox.close_room(room_id)
-        room.players.clear()
-        room.played_cards = []
-        room.deck.clear()
-        room.available_blacks = []
-        room.renew_votes.clear()
-        room.join_order = []
+        with self._sala(room):
+            room.players.clear()
+            room.played_cards = []
+            room.deck.clear()
+            room.available_blacks = []
+            room.renew_votes.clear()
+            room.join_order = []
+        return [(room_id, sid) for sid in sids]
 
-    @transactional
+    # --- Observabilidad -------------------------------------------------------
+
+    def metrics(self):
+        """Instantánea numérica del proceso para el endpoint `/metrics`.
+
+        NO se toma bajo un cerrojo único, y eso es deliberado en las dos
+        direcciones. Ni por cortesía (meter el registro entero alrededor de la
+        lectura convertiría un endpoint de diagnóstico en el siguiente cliente
+        del reaper) ni por necesidad: el reaper ya no borra salas por debajo de
+        esta lectura, así que el `RuntimeError: dictionary changed size during
+        iteration` que justificaba el cerrojo global ya no puede ocurrir. Lo
+        que hace es tomar el registro un instante para COPIAR la lista de salas
+        y los contadores, y después leer cada mesa con SU cerrojo, una por una.
+
+        La foto no es atómica, y no puede serlo sin volver al cerrojo global,
+        pero sí es coherente sala a sala: ningún número mezcla dos estados de la
+        misma mesa, y una mesa que desaparece a mitad del recorrido simplemente
+        no cuenta.
+
+        Mezcla dos clases de número a propósito, y por eso las separa en dos
+        bloques en vez de soltar todo junto:
+
+        - MEDIDORES (gauge): el estado de AHORA. Suben y bajan; una sala purgada
+          deja de contar. Es lo que se mira en un panel.
+        - CONTADORES (acumulado): sumas desde el arranque del proceso. Solo
+          suben. `self.presencia` y `salas_rechazadas` son de este tipo, así que
+          `presencia.salas.purgado` NO son las salas purgadas ahora mismo, son
+          todas las que se han purgado en la vida del proceso. Leerlos como un
+          gauge es la forma más fácil de equivocarse al leer esta respuesta, y
+          por eso el instantaneous va al lado para poder contrastarlos.
+
+        Alcance: solo se ven los clientes con asiento en alguna sala. Un sid
+        conectado al socket que nunca ha entrado a un juego no aparece en
+        ningún sitio del GameManager, así que estos números son de "clientes en
+        partida", no de "sockets abiertos". Contar los segundos exigiría
+        instrumentar el ciclo de vida de Socket.IO, que no existe aquí.
+        """
+        ahora = time.time()
+        with self._registro():
+            total_salas = len(self.rooms)
+            room_ids = list(self.rooms)
+        with self._contadores_lock:
+            presencia = {ambito: dict(fases)
+                         for ambito, fases in self.presencia.items()}
+            rechazadas = self.salas_rechazadas
+
+        salas_por_estado = {}
+        salas_fase = {VIVO: 0, SOSPECHOSO: 0, PURGADO: 0}
+        jugadores_fase = {VIVO: 0, SOSPECHOSO: 0, PURGADO: 0}
+        conectados = 0
+        asientos = 0
+        mudos = 0
+
+        for room_id in room_ids:
+            with self._sala_de_id(room_id) as room:
+                if room is None:
+                    continue
+                datos = self._datos_de_sala(room)
+            # Se acumula FUERA del cerrojo: los números no son estado de nadie y
+            # no necesitan estar protegidos mientras se suman.
+            estado, fase = datos['estado'], datos['fase']
+            salas_por_estado[estado] = salas_por_estado.get(estado, 0) + 1
+            salas_fase[fase] = salas_fase.get(fase, 0) + 1
+            for fase_j, n in datos['fases'].items():
+                jugadores_fase[fase_j] = jugadores_fase.get(fase_j, 0) + n
+            asientos += datos['asientos']
+            conectados += datos['conectados']
+            mudos += datos['mudos']
+
+        return {
+            'timestamp': ahora,
+            'salas': {
+                # El total es el de la MISMA foto que la lista de ids que se
+                # recorren debajo: si el reaper purga una mesa entremedias, este
+                # bloque y el de `por_estado` lo cuentan igual, y quien lea el
+                # panel ve un número que cuadra con lo que se midió.
+                'total': total_salas,
+                'max': self.MAX_ROOMS,
+                'por_estado': salas_por_estado,
+            },
+            'jugadores': {
+                'conectados': conectados,
+                'asientos': asientos,
+                'mudos': mudos,
+            },
+            'salas_rechazadas': rechazadas,
+            # Acumulado de transiciones desde el arranque del proceso, ya
+            # copiado: quien lo lee después no está mirando un dict que otro
+            # hilo está mutando.
+            'presencia': presencia,
+            # Medidor: quién está en qué fase AHORA.
+            'presencia_actual': {
+                'jugadores': jugadores_fase,
+                'salas': salas_fase,
+            },
+        }
+
+    def _datos_de_sala(self, room):
+        """Lo que UNA mesa aporta a `/metrics`. Se mide con su cerrojo tomado y
+        se devuelve como datos, no como referencias vivas: el llamante suma
+        fuera del cerrojo y no necesita retener a nadie para hacerlo.
+
+        - Un asiento purgado o desconectado sigue en `players` a propósito
+          (conserva mano y marcador), así que `asientos` y `conectados` no son
+          el mismo número y la diferencia es justamente la que se está fugando.
+        - Un "mudo" es un cliente conectado que aún no ha contestado ni un solo
+          latido. Es el grupo que el reaper juzga con PRESENCE_SIN_PRUEBA, y la
+          razón de que una sala siga ocupada sin que nadie juegue: el
+          transporte vive aunque el JS haya muerto, y así es como se cuelan en
+          el techo de salas.
+        """
+        datos = {'estado': room.state, 'fase': room.presence.state, 'fases': {},
+                 'asientos': 0, 'conectados': 0, 'mudos': 0}
+        for p in room.players.values():
+            datos['asientos'] += 1
+            fase_j = p.presence.state
+            datos['fases'][fase_j] = datos['fases'].get(fase_j, 0) + 1
+            if not p.is_connected:
+                continue
+            datos['conectados'] += 1
+            if not p.heartbeat_pongs:
+                datos['mudos'] += 1
+        return datos
+
     def start_game(self, sid, room_id):
-        self._start_game_locked(sid, room_id)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._start_game_locked(sid, room_id, room)
 
-    def _start_game_locked(self, sid, room_id):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'waiting' and room.leader == sid:
+    def _start_game_locked(self, sid, room_id, room=None):
+        if room is not None:
+            if room.state == 'waiting' and room.leader == sid and room.asiento(sid) is not None:
                 active = room.get_active_players()
                 # Guard temprano: sin dos jugadores conectados no se inicia nada.
                 # Va antes de cualquier reparto o mutación de estado para no quemar
@@ -736,16 +1214,17 @@ class GameManager:
                 drawn = random.choice(room.available_blacks)
                 room.available_blacks.remove(drawn)
                 room.black_card = drawn
-                self.send_room_update(room_id)
+                self.send_room_update(room_id, _room=room)
 
-    @transactional
     def update_options(self, sid, room_id, data):
-        self._update_options_locked(sid, room_id, data)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._update_options_locked(sid, room_id, data, room)
 
-    def _update_options_locked(self, sid, room_id, data):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'waiting' and room.leader == sid:
+    def _update_options_locked(self, sid, room_id, data, room=None):
+        if room is not None:
+            if (room.state == 'waiting' and room.leader == sid
+                    and room.asiento(sid) is not None):
                 try:
                     hsize = int(data.get('hand_size', room.options['hand_size']))
                     if 1 <= hsize <= 20:
@@ -764,22 +1243,37 @@ class GameManager:
                 if t_order in ['winner', 'random', 'sequential']:
                     room.options['turn_order'] = t_order
                     
-                self.send_room_update(room_id)
+                self.send_room_update(room_id, _room=room)
 
-    @transactional
     def play_card(self, sid, room_id, card_index):
-        self._play_card_locked(sid, room_id, card_index)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._play_card_locked(sid, room_id, card_index, room)
 
-    def _play_card_locked(self, sid, room_id, card_index):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'playing' and sid != room.czar and sid in room.players:
-                p = room.players[sid]
+    def _play_card_locked(self, sid, room_id, card_index, room=None):
+        if room is not None:
+            p = room.asiento(sid)
+            if room.state == 'playing' and sid != room.czar and p is not None:
                 if p.waiting_next_round or p.played_card is not None:
                     return
-                
+
+                # Los índices vienen del cliente y no son de fiar tal cual. Se
+                # filtran a enteros EN RANGO y se deduplican ANTES de tocar la
+                # mano, y no después, por dos razones concretas:
+                #
+                # 1. `0 <= i` con un `None` o un texto revienta con TypeError, y
+                #    con eso se cae la jugada entera: un elemento mal formado
+                #    entre los válidos se lleva por delante la selección buena.
+                # 2. Un índice repetido ([0, 0]) jugaba la MISMA carta dos veces
+                #    y sacaba DOS cartas de la mano: la segunda se perdía del
+                #    sistema para siempre. Es conservación de cartas, que es
+                #    justo lo que este código no puede dejar en manos del
+                #    cliente.
                 indices = card_index if isinstance(card_index, list) else [card_index]
-                valid_indices = [i for i in indices if 0 <= i < len(p.hand)]
+                valid_indices = []
+                for i in indices:
+                    if isinstance(i, int) and 0 <= i < len(p.hand) and i not in valid_indices:
+                        valid_indices.append(i)
                 if valid_indices:
                     # Preservar el orden original en el que el jugador seleccionó las cartas
                     played_texts = [p.hand[i] for i in valid_indices]
@@ -799,78 +1293,89 @@ class GameManager:
                         room.state = 'judging'
                         random.shuffle(room.played_cards)
                         
-                    self.send_room_update(room_id)
+                    self.send_room_update(room_id, _room=room)
 
-    @transactional
     def reveal_card(self, sid, room_id, sub_id):
-        self._reveal_card_locked(sid, room_id, sub_id)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._reveal_card_locked(sid, room_id, sub_id, room)
 
-    def _reveal_card_locked(self, sid, room_id, sub_id):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'judging' and sid == room.czar:
+    def _reveal_card_locked(self, sid, room_id, sub_id, room=None):
+        if room is not None:
+            if (room.state == 'judging' and sid == room.czar
+                    and room.asiento(sid) is not None):
                 for c in room.played_cards:
                     if c.get('id') == sub_id:
                         c['revealed'] = True
                         break
-                self.send_room_update(room_id)
+                self.send_room_update(room_id, _room=room)
 
-    @transactional
     def choose_winner(self, sid, room_id, sub_id):
-        self._choose_winner_locked(sid, room_id, sub_id)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._choose_winner_locked(sid, room_id, sub_id, room)
 
-    def _choose_winner_locked(self, sid, room_id, sub_id):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'judging' and sid == room.czar:
+    def _choose_winner_locked(self, sid, room_id, sub_id, room=None):
+        if room is not None:
+            if (room.state == 'judging' and sid == room.czar
+                    and room.asiento(sid) is not None):
                 winner_sid = None
                 for c in room.played_cards:
                     if c.get('id') == sub_id:
                         winner_sid = c['sid']
                         break
                         
-                if winner_sid and winner_sid in room.players:
-                    # No premiar a quien se ha desconectado durante la ronda:
-                    # last_winner apuntaría a un sid muerto y congelaría la rotación
-                    if not room.players[winner_sid].is_connected:
-                        return
-                    room.players[winner_sid].points += 1
+                # No premiar a quien se ha desconectado durante la ronda:
+                # last_winner apuntaría a un sid muerto y congelaría la rotación
+                ganador = room.asiento(winner_sid) if winner_sid else None
+                if ganador is not None:
+                    ganador.points += 1
                     room.state = 'round_end'
-                    room.last_winner = winner_sid
+                    room.last_winner = ganador.sid
                     room.last_winning_card = [c for c in room.played_cards if c.get('id') == sub_id][0]['cards']
-                    room.last_winner_name = room.players[winner_sid].name
-                    self.send_room_update(room_id)
+                    room.last_winner_name = ganador.name
+                    self.send_room_update(room_id, _room=room)
                     
                     self.socketio.start_background_task(self.auto_next_round, room_id, sid)
 
     def auto_next_round(self, room_id, old_czar_sid):
-        # La espera va FUERA de la transacción a propósito: dentro del RLock
-        # global serían 5 s de servidor parado (la partida entera, todas las
-        # salas) por un auto-avance de ronda.
+        # La espera va FUERA de la transacción a propósito: dentro del cerrojo
+        # serían 5 s de sala parada (y con el registro global encima, 5 s de
+        # servidor parado) por un simple auto-avance de ronda.
         self.socketio.sleep(5)
-        with self._outbox.transaction():
-            room = self.rooms.get(room_id)
-            if room and room.state == 'round_end' and room.czar == old_czar_sid:
-                self.advance_to_next_round(room_id)
+        # La comprobación va DENTRO del cerrojo de esa sala: entre el sleep y
+        # aquí el juez puede haber cambiado o la ronda haberse-advanzado, y un
+        # auto-avance a destiempo rehece una ronda que ya no existe.
+        with self._tx_sala(room_id) as room:
+            if room is not None and room.state == 'round_end' and room.czar == old_czar_sid:
+                self.advance_to_next_round(room_id, room)
 
-    @transactional
     def force_next_round(self, sid, room_id):
-        self._force_next_round_locked(sid, room_id)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._force_next_round_locked(sid, room_id, room)
 
-    def _force_next_round_locked(self, sid, room_id):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'round_end' and room.czar == sid:
-                self.advance_to_next_round(room_id)
+    def _force_next_round_locked(self, sid, room_id, room=None):
+        if room is not None:
+            if (room.state == 'round_end' and room.czar == sid
+                    and room.asiento(sid) is not None):
+                self.advance_to_next_round(room_id, room)
 
-    @transactional
-    def advance_to_next_round(self, room_id):
+    def advance_to_next_round(self, room_id, _ya_en_mano=None):
         # Público porque lo invocan auto_next_round, _force_next_round_locked,
-        # _heal_stale_roles y los tests: anidado en una transacción en curso no
-        # encola nada propio, se sale con la de fuera.
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            
+        # _heal_stale_roles y los tests.
+        #
+        # `_ya_en_mano` es la sala cuya transacción sigue abierta en ESTE hilo:
+        # quien la pasa ya tiene su cerrojo tomado, y volver a buscarla en el
+        # registro sería tomar el registro con una sala en la mano, que es el
+        # orden prohibido. Si no se pasa, se resuelve sola y abre su propia
+        # transacción (el caso de `auto_next_round` y de los tests).
+        #
+        # Anidada y reentrante por diseño: su lote se funde con el de fuera en
+        # vez de provocar un drenaje propio en mitad de la partida.
+        with self._tx_sala(room_id, room=_ya_en_mano) as room:
+            if room is None:
+                return
             turn_order = room.options['turn_order']
             active_players = room.get_active_players()
             
@@ -914,16 +1419,17 @@ class GameManager:
                 if faltan > 0:
                     p.hand.extend(room.deal_cards(faltan))
                     
-            self.send_room_update(room_id)
+            self.send_room_update(room_id, _room=room)
 
-    @transactional
     def vote_card(self, sid, room_id, card_id):
-        self._vote_card_locked(sid, room_id, card_id)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._vote_card_locked(sid, room_id, card_id, room)
 
-    def _vote_card_locked(self, sid, room_id, card_id):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state in ['judging', 'round_end'] and sid != room.czar and sid in room.players:
+    def _vote_card_locked(self, sid, room_id, card_id, room=None):
+        if room is not None:
+            if (room.state in ['judging', 'round_end'] and sid != room.czar
+                    and room.asiento(sid) is not None):
                 target_sub = None
                 for c in room.played_cards:
                     if c.get('id') == card_id:
@@ -949,26 +1455,33 @@ class GameManager:
                     if not has_voted_this:
                         target_sub['votes'].add(sid)
                         
-                self.send_room_update(room_id)
+                self.send_room_update(room_id, _room=room)
 
-    @transactional
     def vote_renew(self, sid, room_id):
-        self._vote_renew_locked(sid, room_id)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._vote_renew_locked(sid, room_id, room)
 
-    def _vote_renew_locked(self, sid, room_id):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if sid in room.players and room.players[sid].is_connected:
+    def _vote_renew_locked(self, sid, room_id, room=None):
+        if room is not None:
+            if room.asiento(sid) is not None:
                 if sid in room.renew_votes:
                     room.renew_votes.remove(sid)
                 else:
                     room.renew_votes.add(sid)
                 
                 self.check_and_execute_renew(room)
-                self.send_room_update(room_id)
+                self.send_room_update(room_id, _room=room)
 
-    @transactional
     def check_and_execute_renew(self, room):
+        # Anidada: la llaman vote_renew y _release_from_room, que ya tienen el
+        # cerrojo de esta misma sala. Reentrante, y su lote se funde con el de
+        # fuera en vez de provocar un drenaje propio en medio.
+        with self._sala(room), self._outbox.lote() as lote:
+            self._check_and_execute_renew(room)
+        self._outbox.drenar(lote)
+
+    def _check_and_execute_renew(self, room):
         active = room.get_active_players()
         eligible = [p for p in active if p.sid != room.czar and not p.waiting_next_round]
         voters = eligible if eligible else active
@@ -1000,16 +1513,17 @@ class GameManager:
                 room.played_cards = []
                 if room.state == 'judging':
                     room.state = 'playing'
-                self.send_chat_system(room.room_id, '¡Se han renovado las cartas de todos los jugadores!')
+                self.send_chat_system(room.room_id, '¡Se han renovado las cartas de todos los jugadores!', _room=room)
 
-    @transactional
     def change_black_card(self, sid, room_id):
-        self._change_black_card_locked(sid, room_id)
+        with self._tx_sala(room_id) as room:
+            if room is not None:
+                self._change_black_card_locked(sid, room_id, room)
 
-    def _change_black_card_locked(self, sid, room_id):
-        if room_id in self.rooms:
-            room = self.rooms[room_id]
-            if room.state == 'playing' and room.czar == sid:
+    def _change_black_card_locked(self, sid, room_id, room=None):
+        if room is not None:
+            if (room.state == 'playing' and room.czar == sid
+                    and room.asiento(sid) is not None):
                 old_black = room.black_card
                 if not room.available_blacks:
                     room.available_blacks = list(self.global_black_cards)
@@ -1027,378 +1541,38 @@ class GameManager:
                             p.hand.append(p.played_card)
                         p.played_card = None
                 room.played_cards = []
-                self.send_chat_system(room_id, 'El juez ha cambiado la carta negra. ¡Tenéis que volver a jugar!')
-                self.send_room_update(room_id)
+                self.send_chat_system(room_id, 'El juez ha cambiado la carta negra. ¡Tenéis que volver a jugar!', _room=room)
+                self.send_room_update(room_id, _room=room)
 
-    def _get_custom_file_path(self):
-        import os
-        # Sobrescribible por entorno: los tests la aíslan para no tocar datos reales
-        env_path = os.environ.get("INTERNAL_CUSTOM_PATH")
-        if env_path:
-            return os.path.abspath(env_path)
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.abspath(os.path.join(base_dir, "..", "DataScraping", "cartasCustom.json"))
-
-    def _get_external_custom_dir(self):
-        import os
-        env_dir = os.environ.get("EXTERNAL_CARDS_DIR")
-        if env_dir:
-            return os.path.abspath(env_dir)
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.abspath(os.path.join(base_dir, "..", "..", "custom_cards"))
-
-    def _save_custom_data(self, custom_data):
-        import os
-        internal_path = self._get_custom_file_path()
-        os.makedirs(os.path.dirname(internal_path), exist_ok=True)
-        with open(internal_path, 'w', encoding='utf-8') as f:
-            json.dump(custom_data, f, ensure_ascii=False, indent=2)
-
-        try:
-            external_dir = self._get_external_custom_dir()
-            os.makedirs(external_dir, exist_ok=True)
-            external_path = os.path.join(external_dir, "cartasCustom.json")
-            with open(external_path, 'w', encoding='utf-8') as f:
-                json.dump(custom_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print("Error exportando cartas a carpeta externa:", e)
-
-    @transactional
-    def add_custom_card(self, card_type, text, pick, respond_cb):
-        # Transacción completa: muta el mazo global, el archivo y las salas.
-        # El callback se difiere: escribirle al cliente que pregunta es E/S, y
-        # aquí el cerrojo es el global de la partida entera.
-        respond_cb = self._outbox.deferred(respond_cb)
-        self._add_custom_card_locked(card_type, text, pick, respond_cb)
-
-    def _add_custom_card_locked(self, card_type, text, pick, respond_cb):
-        import os
-        text = text.strip()
-        if not text:
-            respond_cb({'success': False, 'message': 'El texto está vacío.'})
-            return
-            
-        def check_sim(new_txt, lst, thresh=0.85):
-            n_l = new_txt.lower()
-            for c in lst:
-                tc = c if isinstance(c, str) else c.get('text', '')
-                if difflib.SequenceMatcher(None, n_l, tc.lower().strip()).ratio() >= thresh:
-                    return True, tc
-            return False, None
-            
-        custom_path = self._get_custom_file_path()
-        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-        custom_data = {"whiteCards": [], "blackCards": []}
-        
-        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-        if target_path:
-            try:
-                with open(target_path, 'r', encoding='utf-8') as f:
-                    custom_data = json.load(f)
-            except Exception as e:
-                print("Error leyendo json custom:", e)
-
-        if card_type == 'white':
-            is_sim, match = check_sim(text, self.global_white_cards)
-            if is_sim:
-                respond_cb({'success': False, 'message': f'Muy similar a una carta existente: "{match}"'})
-                return
-            self.global_white_cards.append(text)
-            if 'whiteCards' not in custom_data:
-                custom_data['whiteCards'] = []
-            if text not in custom_data['whiteCards']:
-                custom_data['whiteCards'].append(text)
-            for room in self.rooms.values():
-                room.deck.inject([text])  # el mazo crece solo, sin contador paralelo
-        elif card_type == 'black':
-            is_sim, match = check_sim(text, self.global_black_cards)
-            if is_sim:
-                respond_cb({'success': False, 'message': f'Muy similar a una carta existente: "{match}"'})
-                return
-            new_c = {'text': text, 'pick': pick}
-            self.global_black_cards.append(new_c)
-            if 'blackCards' not in custom_data:
-                custom_data['blackCards'] = []
-            custom_data['blackCards'].append(new_c)
-            for room in self.rooms.values():
-                room.available_blacks.append(new_c)
-                random.shuffle(room.available_blacks)
-        else:
-            respond_cb({'success': False, 'message': 'Tipo de carta inválido.'})
-            return
-            
-        try:
-            self._save_custom_data(custom_data)
-        except Exception as e:
-            respond_cb({'success': False, 'message': f'Error guardando cartas custom: {str(e)}'})
-            return
-            
-        respond_cb({'success': True, 'whiteCards': custom_data.get('whiteCards', []), 'blackCards': custom_data.get('blackCards', [])})
-
-    @transactional
-    def get_custom_cards(self, respond_cb):
-        respond_cb = self._outbox.deferred(respond_cb)
-        import os
-        custom_path = self._get_custom_file_path()
-        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-        
-        if target_path:
-            try:
-                with open(target_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
-                    return
-            except Exception as e:
-                respond_cb({'success': False, 'message': str(e)})
-                return
-        respond_cb({'success': True, 'whiteCards': [], 'blackCards': []})
-
-    @transactional
-    def delete_custom_card(self, card_type, text, respond_cb):
-        respond_cb = self._outbox.deferred(respond_cb)
-        self._delete_custom_card_locked(card_type, text, respond_cb)
-
-    def _delete_custom_card_locked(self, card_type, text, respond_cb):
-        import os
-        custom_path = self._get_custom_file_path()
-        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-        
-        if not target_path:
-            respond_cb({'success': False, 'message': 'Archivo no encontrado.'})
-            return
-        try:
-            with open(target_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            if card_type == 'white':
-                w_list = data.get('whiteCards', [])
-                data['whiteCards'] = [c for c in w_list if (c if isinstance(c, str) else c.get('text')) != text]
-                if text in self.global_white_cards:
-                    self.global_white_cards.remove(text)
-            elif card_type == 'black':
-                b_list = data.get('blackCards', [])
-                data['blackCards'] = [c for c in b_list if (c if isinstance(c, str) else c.get('text')) != text]
-                self.global_black_cards = [c for c in self.global_black_cards if (c if isinstance(c, str) else c.get('text')) != text]
-            
-            self._save_custom_data(data)
-            respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
-        except Exception as e:
-            respond_cb({'success': False, 'message': str(e)})
-
-    @staticmethod
-    def _card_texts(cards):
-        """Textos normalizados de una lista de cartas (acepta str o {text, pick})."""
-        out = set()
-        for c in cards:
-            t = c if isinstance(c, str) else (c.get('text') if isinstance(c, dict) else None)
-            if isinstance(t, str) and t.strip():
-                out.add(t.strip())
-        return out
-
-    @transactional
-    def import_custom_cards(self, raw_json, respond_cb):
-        """
-        Importa un set completo de cartas desde el contenido de un archivo .json
-        con el mismo formato que los sets base (p. ej. CAH-es-set.json):
-
-            { "whiteCards": ["texto", ...],
-              "blackCards": [ { "text": "...", "pick": 2 }, ... ] }
-
-        Valida carta a carta: las inválidas (tipo/longitud/pick/huecos) y las
-        duplicadas (dentro del archivo, en cartasCustom.json o en el mazo base)
-        se descartan individualmente; el resto se guarda y se inyecta en el
-        mazo global y en las salas activas, igual que add_custom_card.
-        """
-        respond_cb = self._outbox.deferred(respond_cb)
-        self._import_custom_cards_locked(raw_json, respond_cb)
-
-    def _import_custom_cards_locked(self, raw_json, respond_cb):
-        import os
-
-        MAX_TEXT_LEN = 200   # longitud máxima por carta
-        MAX_PICK = 3         # máximo de cartas a jugar por ronda (coincide con el taller)
-        MAX_DETAILS = 10     # ejemplos de rechazo/omisión devueltos al cliente
-
-        # 1) Parsear el JSON crudo y exigir la estructura del formato base
-        if isinstance(raw_json, (dict, list)):
-            data = raw_json  # el cliente también puede enviar el objeto ya parseado
-        else:
-            try:
-                data = json.loads(raw_json)
-            except (TypeError, ValueError) as e:
-                respond_cb({'success': False, 'message': f'JSON inválido: {e}'})
-                return
-
-        if not isinstance(data, dict) or ('whiteCards' not in data and 'blackCards' not in data):
-            respond_cb({'success': False,
-                        'message': 'Estructura no reconocida: se esperaba un objeto con "whiteCards" y/o "blackCards".'})
-            return
-
-        def clean_text(value):
-            """Texto listo para guardar, o None si no es válido como carta."""
-            if not isinstance(value, str):
-                return None
-            text = value.strip()
-            if not text or len(text) > MAX_TEXT_LEN:
-                return None
-            return text
-
-        rejected, ignored = [], []
-        n_rejected = n_ignored = 0
-
-        def reject(reason):
-            nonlocal n_rejected
-            n_rejected += 1
-            if len(rejected) < MAX_DETAILS:
-                rejected.append(reason)
-
-        def ignore(reason):
-            nonlocal n_ignored
-            n_ignored += 1
-            if len(ignored) < MAX_DETAILS:
-                ignored.append(reason)
-
-        # Cartas que ya están en juego (base + customs cargadas al arrancar)
-        existing_whites = self._card_texts(self.global_white_cards)
-        existing_blacks = self._card_texts(self.global_black_cards)
-
-        # 2) Blancas: cadenas de texto no vacías y no duplicadas
-        new_whites = []
-        raw_whites = data.get('whiteCards', [])
-        if not isinstance(raw_whites, list):
-            reject('whiteCards: no es una lista')
-            raw_whites = []
-        for i, item in enumerate(raw_whites):
-            text = clean_text(item)
-            if text is None:
-                if not isinstance(item, str):
-                    reject(f'Blanca #{i + 1}: debe ser texto, no {type(item).__name__}')
-                elif len(item.strip()) > MAX_TEXT_LEN:
-                    reject(f'Blanca #{i + 1}: demasiado larga (máx. {MAX_TEXT_LEN} caracteres)')
-                else:
-                    reject(f'Blanca #{i + 1}: vacía')
-                continue
-            if text in new_whites:
-                ignore(f'Blanca duplicada en el archivo: "{text[:40]}"')
-                continue
-            if text in existing_whites:
-                ignore(f'Ya existe en el mazo: "{text[:40]}"')
-                continue
-            new_whites.append(text)
-
-        # 3) Negras: {text, pick}; se tolera texto plano como pick=1
-        new_blacks = []
-        new_black_texts = set()
-        raw_blacks = data.get('blackCards', [])
-        if not isinstance(raw_blacks, list):
-            reject('blackCards: no es una lista')
-            raw_blacks = []
-        for i, item in enumerate(raw_blacks):
-            if isinstance(item, dict):
-                text = clean_text(item.get('text'))
-                raw_pick = item.get('pick', 1)
-            elif isinstance(item, str):
-                text = clean_text(item)
-                raw_pick = 1
-            else:
-                text, raw_pick = None, 1
-
-            if text is None:
-                reject(f'Negra #{i + 1}: falta o es inválido el texto')
-                continue
-
-            try:
-                pick = int(raw_pick)  # se tolera "2" o 2.0
-            except (TypeError, ValueError):
-                reject(f'Negra #{i + 1}: "pick" no es un número ({raw_pick!r})')
-                continue
-            if not 1 <= pick <= MAX_PICK:
-                reject(f'Negra #{i + 1}: "pick" fuera de rango (1-{MAX_PICK}): {pick}')
-                continue
-            # Una negra pick>=2 necesita al menos `pick` huecos (_) para ser jugable
-            if pick >= 2 and text.count('_') < pick:
-                reject(f'Negra #{i + 1}: necesita al menos {pick} guion(es) bajo(s) "_" para pick={pick}')
-                continue
-            if text in new_black_texts:
-                ignore(f'Negra duplicada en el archivo: "{text[:40]}"')
-                continue
-            if text in existing_blacks:
-                ignore(f'Ya existe en el mazo: "{text[:40]}"')
-                continue
-
-            new_black_texts.add(text)
-            new_blacks.append({'text': text, 'pick': pick})
-
-        if not new_whites and not new_blacks:
-            respond_cb({'success': False,
-                        'message': f'Ninguna carta válida para importar ({n_rejected} inválidas, {n_ignored} duplicadas).',
-                        'rejected': rejected,
-                        'ignored': ignored})
-            return
-
-        # 4) Fusionar con cartasCustom.json y guardar (ruta interna + externa)
-        custom_path = self._get_custom_file_path()
-        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-        custom_data = {"whiteCards": [], "blackCards": []}
-        if target_path:
-            try:
-                with open(target_path, 'r', encoding='utf-8') as f:
-                    custom_data = json.load(f)
-            except Exception as e:
-                print("Error leyendo json custom:", e)
-        if not isinstance(custom_data, dict):
-            custom_data = {"whiteCards": [], "blackCards": []}
-
-        file_whites = self._card_texts(custom_data.get('whiteCards', []))
-        file_blacks = self._card_texts(custom_data.get('blackCards', []))
-        for w in new_whites:
-            if w not in file_whites:
-                custom_data.setdefault('whiteCards', []).append(w)
-        for b in new_blacks:
-            if b['text'] not in file_blacks:
-                custom_data.setdefault('blackCards', []).append(b)
-
-        try:
-            self._save_custom_data(custom_data)
-        except Exception as e:
-            respond_cb({'success': False, 'message': f'Error guardando cartas custom: {e}'})
-            return
-
-        # 5) Inyectar en el mazo global y en las salas activas (en directo)
-        self.global_white_cards.extend(new_whites)
-        self.global_black_cards.extend(new_blacks)
-        for room in self.rooms.values():
-            if new_whites:
-                room.deck.inject(new_whites)
-            if new_blacks:
-                room.available_blacks.extend(new_blacks)
-                random.shuffle(room.available_blacks)
-
-        respond_cb({'success': True,
-                    'imported': {'white': len(new_whites), 'black': len(new_blacks)},
-                    'rejected_count': n_rejected,
-                    'ignored_count': n_ignored,
-                    'rejected': rejected,
-                    'ignored': ignored,
-                    'whiteCards': custom_data.get('whiteCards', []),
-                    'blackCards': custom_data.get('blackCards', [])})
-
-    @transactional
     def add_room_cards(self, room_id, cards_str):
-        room = self.rooms.get(room_id)
-        if room:
-            new_cards = [c.strip() for c in cards_str.split(',') if c.strip()]
-            if new_cards:
-                room.deck.inject(new_cards)
-                self.send_chat_system(room_id, f'Se han añadido {len(new_cards)} cartas personalizadas a la sala.')
+        """Inyecta cartas propias en el mazo de UNA sala. No toca el mazo global
+        (eso es del registro, en models/custom_cards.py): aquí solo crece el
+        mazo de la mesa, con su cerrojo.
 
-    @transactional
+        `cards_str` llega del cliente y puede no ser una cadena (un `null` en el
+        JSON es un `None` aquí): se descarta lo que no sea texto en vez de
+        reventar el handler entero."""
+        if not isinstance(cards_str, str):
+            return
+        new_cards = [c.strip() for c in cards_str.split(',') if c.strip()]
+        if not new_cards:
+            return
+        with self._tx_sala(room_id) as room:
+            if room is None:
+                return
+            room.deck.inject(new_cards)
+            self.send_chat_system(room_id, f'Se han añadido {len(new_cards)} cartas personalizadas a la sala.', _room=room)
+
     def send_chat(self, sid, room_id, msg):
-        room = self.rooms.get(room_id)
-        if room and msg and sid in room.players:
-            pname = room.players[sid].name
-            self._outbox.add_direct(room_id, 'chat_message',
-                                    {'msg': msg, 'sender': pname, 'system': False}, to=room_id)
+        # El mensaje también es dato del cliente: un `null` o un objeto se
+        # descarta, y se recorta a lo que mide un mensaje (el `maxlength` del
+        # navegador no es una defensa: el chat se difunde a la mesa entera).
+        if not isinstance(msg, str) or not msg.strip():
+            return
+        msg = msg[:MAX_CHAT]
+        with self._tx_sala(room_id) as room:
+            jugador = room.asiento(sid) if room is not None else None
+            if jugador is not None:
+                self._outbox.add_direct(room_id, 'chat_message',
+                                        {'msg': msg, 'sender': jugador.name,
+                                         'system': False}, to=room_id)

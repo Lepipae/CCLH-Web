@@ -47,8 +47,8 @@ def _dos_pasadas(manager):
 
 def _answer_heartbeats(room):
     """Deja a los jugadores de `room` como clientes que ya han contestado algún
-    latido. Es el requisito para que el reaper pueda juzgarlos: sin esta prueba
-    previa no hay evidencia de nada y no se purga a nadie."""
+    latido, que es lo que hace que se les juzgue con la política normal y no con
+    la más generosa de quien no ha dado ninguna prueba."""
     for p in room.players.values():
         p.heartbeat_pongs = max(p.heartbeat_pongs, 1)
 
@@ -224,8 +224,10 @@ class TestHeartbeatIsTheOnlyLivenessSignal:
         assert alice.heartbeat_pongs == 1  # ya se le puede juzgar
 
     def test_join_alone_does_not_prove_heartbeat_support(self, manager, room_clients):
-        """Entrar no demuestra que el cliente sepa contestar un latido: por eso
-        un build antiguo en caché, que jamás contestará, no acaba purgado."""
+        """Entrar no demuestra que el cliente sepa contestar un latido, y por eso
+        un build antiguo en caché se juzga con la política más generosa. Lo que
+        ya no hace es que eso lo deje sin juicio: ver
+        `test_sin_prueba_acaba_purgado_tras_su_gracia`."""
         clients, sids, room = _start_seq_game(manager, room_clients, "H3", ["Alice", "Bob"])
         assert all(p.heartbeat_pongs == 0 for p in room.players.values())
 
@@ -273,19 +275,152 @@ class TestHeartbeatIsTheOnlyLivenessSignal:
         assert room.empty_since is None
         assert "H5" in manager.rooms
 
-    def test_player_that_never_answered_is_never_purged(self, manager, room_clients, monkeypatch):
-        """Sin ninguna prueba previa de latido no hay evidencia de nada: el
-        reaper se abstiene y deja pasar al zombie hasta que engine.io lo
-        desconecte por su cuenta."""
+    def test_sin_prueba_acaba_purgado_tras_su_gracia(self, manager, room_clients, monkeypatch):
+        """REGRESIÓN: sin ninguna prueba de latido ya no hay salto eterno.
+
+        El transporte de un cliente con el JS de aplicación muerto sigue vivo,
+        así que el `disconnect` de engine.io no llega nunca y el reaper se lo
+        comía como si fuera a purgarse solo. Medido contra un servidor real: 25
+        de estos llenaron el techo de salas y, tras 100 s y siete pasadas,
+        seguían allí, sin un solo aviso. Ahora se les juzga con
+        PRESENCE_SIN_PRUEBA y, vencido su plazo, salen por la puerta de los
+        vivos: aviso, reto, y solo entonces el asiento.
+        """
         clients, sids, room = _start_seq_game(manager, room_clients, "H6", ["Alice", "Bob", "Carol"])
-        _set_politica(manager, monkeypatch, 0.05, 0)
+        _set_politica(manager, monkeypatch, 10**9, 10**9)
+        _set_politica(manager, monkeypatch, 0.05, 0, "PRESENCE_SIN_PRUEBA")
         _go_silent(room, seconds=10**6)  # rancios de días, pero nunca contestaron
+
+        manager.reap_empty_rooms()
+        assert all(p.presence.state == SOSPECHOSO for p in room.players.values())
+        for nombre, c in clients.items():
+            retos = [e for e in c.get_received() if e['name'] == 'presence_challenge']
+            assert retos, f"{nombre} no recibió el reto antes de que le purguen"
+            assert retos[0]['args'][0]['grace'] == 0
+
+        _dos_pasadas(manager)
+
+        assert not any(p.is_connected for p in room.players.values())
+        assert all(p.presence.state == PURGADO for p in room.players.values())
+        # Y la sala, ahora sí vacía, arranca su propio reloj de silencio.
+        assert room.empty_since is not None
+
+    def test_sin_prueba_respeta_la_politica_normal(self, manager, room_clients, monkeypatch):
+        """La otra mitad: con la política de falta de prueba amplia, estos mismos
+        clientes NO se tocan. El margen se aplica, no se ignora."""
+        clients, sids, room = _start_seq_game(manager, room_clients, "H6B", ["Alice", "Bob", "Carol"])
+        _set_politica(manager, monkeypatch, 0.01, 0)
+        _set_politica(manager, monkeypatch, 10**9, 10**9, "PRESENCE_SIN_PRUEBA")
+        _go_silent(room, seconds=10**6)
 
         _dos_pasadas(manager)
 
         assert all(p.is_connected for p in room.players.values())
         assert all(p.presence.state == VIVO for p in room.players.values())
         assert room.empty_since is None
+
+    def test_un_mudo_deja_libre_el_techo_de_salas(self, manager, room_clients, monkeypatch):
+        """El final de la historia: la sala del cliente mudo se acaba purgando,
+        que es lo que hace que el techo de salas sea un tope y no una
+        irreversible. Cada cliente mudo se sienta en una sala propia."""
+        clients, sids = {}, {}
+        for i in range(3):
+            c, sid = room_clients(f"Silencio{i}", f"LEAK{i}")
+            clients[f"Silencio{i}"] = c
+            sids[f"Silencio{i}"] = sid
+        _set_politica(manager, monkeypatch, 0.05, 0, "PRESENCE_SIN_PRUEBA")
+        _set_politica(manager, monkeypatch, 0.05, 0, "ROOM_LIFECYCLE_NUEVA")
+        for i in range(3):
+            _go_silent(manager.rooms[f"LEAK{i}"], seconds=10**6)
+
+        # Pasadas para suspicionar y purgar a los mudos: sus asientos se
+        # liberan y la sala se queda vacía.
+        for _ in range(2):
+            manager.reap_empty_rooms()
+        assert not any(p.is_connected
+                       for i in range(3)
+                       for p in manager.rooms[f"LEAK{i}"].players.values())
+
+        # Y ahora la sala, ya vacía, con su reloj muy atrasado (sin dormir: el
+        # reloj se envejece a mano, igual que en _vaciar). Dos pasadas más la
+        # borran: sospechar y purgar nunca ocurren en la misma.
+        for i in range(3):
+            manager.rooms[f"LEAK{i}"].empty_since = time.time() - 10 ** 6
+        for _ in range(3):
+            manager.reap_empty_rooms()
+
+        assert not [r for r in manager.rooms if r.startswith("LEAK")], (
+            "las salas de los clientes mudos no se purgaron: el techo de salas "
+            "vuelve a ser una irreversible")
+
+
+# --- La sala de Socket.IO no es la sala del GameManager -----------------------
+
+class _ServidorFalso:
+    """Del servidor de Socket.IO solo se falsea `leave_room`, que es lo que se
+    quiere vigilar: el GameManager lo llama a través de `socketio.server` porque
+    el `leave_room` de flask_socketio necesita un contexto de petición y el
+    reaper corre en su propio hilo. Todo lo demás (las emisiones de verdad) se
+    sigue delegando en el servidor real."""
+
+    def __init__(self, real):
+        self._real = real
+        self.salidas = []
+
+    def leave_room(self, sid, room, namespace=None):
+        self.salidas.append((sid, room))
+
+    def __getattr__(self, nombre):
+        return getattr(self._real, nombre)
+
+
+def _servidor_falso(monkeypatch, manager):
+    servidor = _ServidorFalso(manager.socketio.server)
+    monkeypatch.setattr(manager.socketio, "server", servidor)
+    return servidor
+
+
+class TestSalaPurgadaSaleDeSocketIO:
+    """`app.py` mete a cada cliente en una sala de Socket.IO con su codigo de
+    sala, y solo se sale de ella al cambiar de sala (o al desconectarse, que lo
+    hace la propia libreria). La sala del GameManager y esa NO son la misma
+    cosa: un cliente purgado por el reaper sigue conectado, y sin sacarlo de
+    ahi se seguia enterando del chat de la SIGUIENTE mesa que usara ese
+    codigo."""
+
+    def test_la_sala_purgada_saca_a_sus_clientes(self, manager, room_clients, monkeypatch):
+        clients, sids, room = _start_seq_game(manager, room_clients, "OUT1", ["Ana", "Beto", "Caro"])
+        # El parche va DESPUÉS de crear los clientes: `socketio.test_client`
+        # necesita el servidor de verdad para montar su propio socket.
+        servidor = _servidor_falso(monkeypatch, manager)
+        _answer_heartbeats(room)      # PresencePolicy, no la de "sin prueba"
+        _go_silent(room)              # y llevan días sin contestar: son zombis
+
+        _set_politica(manager, monkeypatch, 0.05, 0)                  # PRESENCE
+        _set_politica(manager, monkeypatch, 0.05, 0, "ROOM_LIFECYCLE")
+        _dos_pasadas(manager)                      # los tres son zombis
+        assert all(not p.is_connected for p in room.players.values())
+        # La sala, ya vacía, tiene que morir también para que salga el leave_room
+        room.empty_since = time.time() - 10 ** 6
+        _dos_pasadas(manager)
+
+        assert "OUT1" not in manager.rooms
+        assert sorted(servidor.salidas) == sorted(
+            (sid, "OUT1") for sid in sids.values()), (
+            "los clientes de la sala purgada se quedan dentro de la sala de "
+            "Socket.IO y oiran el chat de la proxima mesa con ese codigo")
+
+    def test_una_sala_que_no_se_purga_no_toca_a_nadie(self, manager, room_clients, monkeypatch):
+        """Contrapeso: `leave_room` es de las salas que se van, no uno por cada
+        foto de la sala."""
+        _start_seq_game(manager, room_clients, "OUT2", ["Ana", "Beto", "Caro"])
+        servidor = _servidor_falso(monkeypatch, manager)
+
+        manager.reap_empty_rooms()
+        manager.reap_empty_rooms()
+
+        assert "OUT2" in manager.rooms
+        assert servidor.salidas == []
 
 
 # --- Regresión: un sid tiene un solo asiento ----------------------------------
@@ -384,3 +519,116 @@ class TestSeatIsUniquePerSid:
         assert manager.room_of(sid_ana) == "S1"
         self._move_to(ana, "Ana", "S2")
         assert manager.room_of(sid_ana) == "S2"  # se movio con ella
+
+
+# --- La purga deja el asiento sin autoridad ----------------------------------
+
+class TestAsientoPurgadoNoManda:
+    """Un asiento purgado o desconectado sigue en `room.players` a propósito
+    (su mano y su marcador se conservan, y la auditoría de cartas cuenta con
+    ellos dentro), así que "estar en players" no puede ser lo que autoriza a
+    jugar: la puerta es `Room.asiento(sid)`.
+
+    Antes de esto un cliente purgado seguía jugando cartas y chateando con su
+    socket abierto. La purga lo volvía invisible pero no le quitaba poderes,
+    que es justo lo contrario de lo que promete la máquina de dos fases.
+    """
+
+    def _mesa_con_un_purgado(self, manager, monkeypatch, room_clients,
+                             room_id, nombres):
+        """Mesa en partida con UN jugador purgado y su socket todavía abierto."""
+        clients, sids, room = _start_seq_game(manager, room_clients, room_id, nombres)
+        _answer_heartbeats(room)                 # con pruebas: política normal
+        _set_politica(manager, monkeypatch, 0.05, 0)
+
+        victima = nombres[-1]
+        assert room.players[sids[victima]].heartbeat_pongs == 1
+        room.players[sids[victima]].last_seen = time.time() - 10 ** 6
+        _dos_pasadas(manager)
+
+        p = room.players[sids[victima]]
+        assert p.presence.state == PURGADO
+        assert p.is_connected is False
+        assert room.state == 'playing', "la partida sigue en pie con los otros"
+        return clients, sids, room, sids[victima], victima
+
+    def test_el_asiento_purgado_no_esta(self, manager, monkeypatch, room_clients):
+        _, _, room, victima, _ = self._mesa_con_un_purgado(
+            manager, monkeypatch, room_clients, "A1",
+            ["Ana", "Beto", "Caro", "Dani"])
+        assert room.asiento(victima) is None
+        assert room.players.get(victima) is not None, "el asiento se conserva"
+
+    def test_el_purgado_no_juega(self, manager, monkeypatch, room_clients):
+        clients, _, room, victima, nombre = self._mesa_con_un_purgado(
+            manager, monkeypatch, room_clients, "A2",
+            ["Ana", "Beto", "Caro", "Dani"])
+        jugadas = len(room.played_cards)
+        mano = len(room.players[victima].hand)
+
+        clients[nombre].emit("play_card", {"room_id": "A2", "card_index": 0})
+
+        assert len(room.played_cards) == jugadas, "una jugada de un purgado no entra"
+        assert len(room.players[victima].hand) == mano, "y no pierde cartas"
+        assert room.players[victima].played_card is None
+
+    def test_el_purgado_no_chatea(self, manager, monkeypatch, room_clients):
+        clients, _, room, victima, nombre = self._mesa_con_un_purgado(
+            manager, monkeypatch, room_clients, "A3",
+            ["Ana", "Beto", "Caro", "Dani"])
+        for c in clients.values():
+            c.get_received()
+
+        clients[nombre].emit("chat", {"room_id": "A3", "msg": "sigo aquí"})
+
+        chats = [e for c in clients.values() for e in c.get_received()
+                 if e['name'] == 'chat_message']
+        assert chats == [], f"el purgado todavía habla: {chats}"
+
+    def test_el_purgado_no_vota(self, manager, monkeypatch, room_clients):
+        clients, _, room, victima, nombre = self._mesa_con_un_purgado(
+            manager, monkeypatch, room_clients, "A5",
+            ["Ana", "Beto", "Caro", "Dani"])
+
+        clients[nombre].emit("vote_renew", {"room_id": "A5"})
+
+        assert victima not in room.renew_votes
+        assert len(room.renew_votes) == 0
+
+    def test_el_desconectado_tampoco_juega(self, manager, room_clients):
+        """El caso corriente: el mismo asiento pero desconectado en vez de
+        purgado. Misma puerta, mismo resultado."""
+        clients, sids = {}, {}
+        for nombre in ["Ana", "Beto", "Caro"]:
+            clients[nombre], sids[nombre] = room_clients(nombre, "A4")
+        room = manager.rooms["A4"]
+        room.options['turn_order'] = 'sequential'
+        manager.start_game(sids["Ana"], "A4")
+        _answer_heartbeats(room)
+
+        cazar = sids["Caro"]
+        manager.disconnect(cazar)
+        assert room.players[cazar].is_connected is False
+        jugadas = len(room.played_cards)
+
+        clients["Caro"].emit("play_card", {"room_id": "A4", "card_index": 0})
+
+        assert len(room.played_cards) == jugadas
+        assert room.players[cazar].played_card is None
+
+    def test_el_asiento_vivo_sigue_pudiendo_hacer_todo(self, manager, monkeypatch,
+                                                        room_clients):
+        """La otra mitad, que es la que importa: el accessor no ha de cerrar la
+        puerta a nadie. Un jugador de los conectados juega con normalidad."""
+        clients, sids, room, _victima, _ = self._mesa_con_un_purgado(
+            manager, monkeypatch, room_clients, "A6",
+            ["Ana", "Beto", "Caro", "Dani"])
+        ana = sids["Ana"]
+        assert room.asiento(ana) is not None
+        mano_ana = len(room.players[ana].hand)
+
+        clients["Beto"].emit("play_card", {"room_id": "A6", "card_index": 0})
+
+        assert len(room.played_cards) == 1
+        assert room.played_cards[0]['sid'] == sids["Beto"]
+        assert len(room.players[ana].hand) == mano_ana  # solo pierde quien juega

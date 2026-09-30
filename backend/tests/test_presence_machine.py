@@ -166,16 +166,9 @@ def _mesa(manager, room_clients, room_id, nombres, con_latido=True):
     manager.start_game(sids[nombres[0]], room_id)
     if con_latido:
         for sid in sids.values():
-            manager.heartbeat(sid)   # prueba de vida: sin ella no hay juicio posible
+            manager.heartbeat(sid)   # prueba de vida: fija PRESENCE en vez de
+            #                            PRESENCE_SIN_PRUEBA, que es más generosa
     return clientes, sids, room
-
-
-def _calla(room, segundos):
-    """Inmoviliza los relojes de la sala: nadie contesta ningún latido."""
-    rancio = time.time() - segundos
-    for p in room.players.values():
-        p.last_seen = rancio
-
 
 
 def _calla(room, segundos):
@@ -353,12 +346,19 @@ class TestReaperEnDosFases:
 
         assert len(vistos) == 2  # los dos sospechosos, un aviso cada uno
 
-    def test_quien_nunca_ha_contestado_no_se_sospecha_nunca(self, manager, room_clients, monkeypatch):
-        """La prueba previa sigue siendo condición: sin evidencia de que el
-        cliente hable el protocolo, su silencio no es prueba de nada."""
+    def test_sin_prueba_se_juzga_con_la_politica_generosa(self, manager, room_clients, monkeypatch):
+        """La falta de pruebas cambia QUÉ política se aplica, no si se aplica.
+
+        Con la política normal puesta a cero y la de falta de prueba al
+        revés, estos jugadores no son sospechosos: son los que no han
+        demostrado que sepan contestar, y el reaper les concede el margen
+        largo. Si el selector de política estuviese roto y usaran PRESENCE,
+        serían sospechosos y purgados en las dos pasadas siguientes.
+        """
         _, _, room = _mesa(manager, room_clients, "P7", ["Ana", "Beto", "Caro"],
                            con_latido=False)
-        _politica(manager, monkeypatch, 0.05, 0)
+        _politica(manager, monkeypatch, 0.01, 0)
+        _politica(manager, monkeypatch, 10 ** 9, 10 ** 9, 'PRESENCE_SIN_PRUEBA')
         _calla(room, 10 ** 7)
 
         manager.reap_empty_rooms()
@@ -367,6 +367,56 @@ class TestReaperEnDosFases:
         assert all(p.presence.state == VIVO for p in room.players.values())
         assert all(p.is_connected for p in room.players.values())
         assert manager.presencia['jugadores'] == {SOSPECHOSO: 0, VIVO: 0, PURGADO: 0}
+
+    def test_sin_prueba_tambien_se_sospecha_y_se_purga(self, manager, room_clients, monkeypatch):
+        """Y cuando su propia política vence, los mismos dos pasos que todos.
+
+        Nadie queda sin juicio: un cliente que jamás contesta un latido es
+        precisamente el que hay que juzgar, porque su transporte sigue vivo
+        (JS bloqueado, hidratación rota, bundle viejo) y sin juicio fijaba
+        su sala para siempre. La gracia sigueamia siendo la red: primero el
+        aviso, después el reto, y solo luego el asiento.
+        """
+        clientes, _, room = _mesa(manager, room_clients, "P7B", ["Ana", "Beto", "Caro"],
+                                  con_latido=False)
+        _politica(manager, monkeypatch, 10 ** 9, 10 ** 9)
+        _politica(manager, monkeypatch, 0.05, 0, 'PRESENCE_SIN_PRUEBA')
+        _calla(room, 10 ** 7)
+
+        manager.reap_empty_rooms()
+        assert all(p.presence.state == SOSPECHOSO for p in room.players.values())
+        for cliente in clientes.values():
+            # Nadie se purga sin haber recibido antes su reto.
+            assert len(_eventos(cliente, 'presence_challenge')) == 1
+
+        manager.reap_empty_rooms()
+        assert all(p.presence.state == PURGADO for p in room.players.values())
+        assert not any(p.is_connected for p in room.players.values())
+
+    def test_quien_contesta_al_reto_conserva_el_asiento(self, manager, room_clients, monkeypatch):
+        """La salida sigue abierta para quien no había dado pruebas: el reto
+        es la última puerta de vuelta y funciona igual de bien."""
+        clientes, sids, room = _mesa(manager, room_clients, "P7C", ["Ana", "Beto", "Caro"],
+                                     con_latido=False)
+        _politica(manager, monkeypatch, 10 ** 9, 10 ** 9)
+        _politica(manager, monkeypatch, 0.05, 300, 'PRESENCE_SIN_PRUEBA')
+        _calla(room, 10 ** 7)
+
+        manager.reap_empty_rooms()
+        assert all(p.presence.state == SOSPECHOSO for p in room.players.values())
+
+        # Contesta Ana al reto: vuelve a vivo y conserva su asiento.
+        clientes['Ana'].emit('heartbeat_pong')
+        ana = room.players[sids['Ana']]
+        assert ana.presence.state == VIVO
+        assert ana.is_connected
+        assert ana.heartbeat_pongs == 1
+
+        # Los otros dos, mudos, siguen siendo sospechosos: el margen no se
+        # consume con el paso del tiempo ni se reinicia solo.
+        manager.reap_empty_rooms()
+        assert all(p.presence.state == SOSPECHOSO
+                   for n, p in room.players.items() if n != sids['Ana'])
 
     def test_el_estado_de_presencia_tambien_viaja_en_el_game_update(
             self, manager, room_clients, monkeypatch):
@@ -393,6 +443,32 @@ class TestReaperEnDosFases:
 # --- El ciclo de vida de la sala --------------------------------------------
 
 class TestSalaEnDosFases:
+    def test_medir_la_sala_no_la_mantiene_viva(self, manager, room_clients, monkeypatch):
+        """Un getter que muta la máquina de presencia es una trampa: `to_dict`
+        llama a `get_active_players` (para saber cuánta gente vota la
+        renovación), y ese método también movía el reloj de la sala. Medir una
+        mesa la mantenía viva, y una sala vacía se colgaba de su propia foto.
+        El reloj de una sala solo puede moverlo la desconexión, que es el
+        evento que lo significa."""
+        _, sids, room = _mesa(manager, room_clients, "S1", ["Ana", "Beto"])
+        manager.disconnect(sids["Beto"])
+        manager.disconnect(sids["Ana"])
+        vacia_desde = room.empty_since
+        assert vacia_desde is not None
+
+        # Serializar el estado no lo reinicia (ni lo indulta)
+        for _ in range(3):
+            room.to_dict(for_sid="fantasma")
+        assert room.empty_since == vacia_desde
+
+        # Y la sala sigue expirando exactamente igual que antes
+        _politica(manager, monkeypatch, 0.05, 0, atributo='ROOM_LIFECYCLE')
+        _calla_vacia(room, 3600)
+        manager.reap_empty_rooms()
+        assert room.presence.state == SOSPECHOSO
+        manager.reap_empty_rooms()
+        assert "S1" not in manager.rooms
+
     def test_una_sala_vacia_no_se_borra_hasta_que_venza_la_gracia(
             self, manager, room_clients, monkeypatch):
         _, sids, room = _mesa(manager, room_clients, "S1", ["Ana", "Beto"])

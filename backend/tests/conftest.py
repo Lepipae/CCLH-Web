@@ -130,8 +130,12 @@ def deck_audit(manager, monkeypatch):
 
     broadcast = manager.send_room_update
 
-    def audited_broadcast(room_id):
-        broadcast(room_id)
+    def audited_broadcast(room_id, *args, **kwargs):
+        # `*args/**kwargs`: las llamadas internas pasan la sala ya resuelta
+        # (`_room=...`) para no volver a tocar el registro con un cerrojo de sala
+        # en la mano. La auditoría no le importa: solo mira que la difusión
+        # ocurra.
+        broadcast(room_id, *args, **kwargs)
         collect()
 
     monkeypatch.setattr(manager, "send_room_update", audited_broadcast)

@@ -282,3 +282,84 @@ class TestConservationOfARealGame:
 
         assert room.players[sids["Beto"]].is_connected is False
         assert room.audit_cards() == []
+
+    def test_cambiarse_de_nombre_no_pierde_la_mano(self, manager, room_clients):
+        """Reentrarse con OTRO nombre no puede crear un jugador nuevo encima del
+        viejo: eso descartaba su mano y su marcador, y las cartas de la mano
+        vieja no estaban ya en ninguna parte (el mazo no las volvía a ver nunca
+        más). Perder cartas es justo lo que este test existe para cazar.
+
+        El caso real: el jugador sigue en la mesa, cambia el apodo en el login y
+        vuelve a entrar."""
+        clients, sids, room = _start_seq_game(manager, room_clients, "R5", ["Ana", "Beto", "Caro"])
+        ana = room.players[sids["Ana"]]
+        mano = list(ana.hand)
+        puntos = ana.points
+
+        assert manager.join_game(sids["Ana"], "Ana2", "R5") is True
+
+        assert room.players[sids["Ana"]].name == "Ana2"
+        assert list(room.players[sids["Ana"]].hand) == mano
+        assert room.players[sids["Ana"]].points == puntos
+        assert room.audit_cards() == []
+        # Y sigue siendo la misma persona para la mesa: no hay un asiento más.
+        assert len(room.players) == 3
+
+    def test_renombrarse_a_un_nombre_ocupado_se_rechaza(self, manager, room_clients):
+        """Contrapeso del anterior: recuperar (o renombrar) el asiento propio no
+        puede pisar el nombre de OTRO jugador conectado. Este test no
+        distingue el arreglo del comportamiento de antes (el chequeo de
+        duplicados ya lo cubría): fija el contrato para que el arreglo no lo
+        rompa por el camino."""
+        clients, sids, room = _start_seq_game(manager, room_clients, "R6", ["Ana", "Beto", "Caro"])
+        mano = list(room.players[sids["Ana"]].hand)
+
+        assert manager.join_game(sids["Ana"], "Beto", "R6") is False
+        assert room.players[sids["Ana"]].name == "Ana"
+        assert list(room.players[sids["Ana"]].hand) == mano
+        assert room.audit_cards() == []
+
+    def test_un_indice_repetido_no_juega_la_misma_carta_dos_veces(self, manager, room_clients):
+        """`[0, 0]` es una elección degenerada que el cliente no puede producir,
+        pero el servidor no se fía: jugaba la misma carta dos veces y sacaba dos
+        cartas de la mano, y la segunda se perdía del sistema para siempre."""
+        clients, sids, room = _start_seq_game(manager, room_clients, "R7", ["Ana", "Beto"], hand_size=5)
+        beto = room.players[sids["Beto"]]
+        antes = len(beto.hand)
+
+        manager.play_card(sids["Beto"], "R7", [0, 0])
+
+        assert len(beto.played_card) == 1
+        assert len(beto.hand) == antes - 1
+        assert room.audit_cards() == []
+
+    def test_una_jugada_con_indices_basura_no_revierte_nada(self, manager, room_clients):
+        """Lo que llega por el socket no es de fiar: un `null`, un texto o un
+        índice fuera de rango no pueden reventar el handler (TypeError en la
+        comparación) ni devolver una jugada a medias. Con el cerrojo de la sala
+        tomado, una excepción ahí se lleva por delante la partida entera."""
+        clients, sids, room = _start_seq_game(manager, room_clients, "R8", ["Ana", "Beto"], hand_size=5)
+        beto = room.players[sids["Beto"]]
+        antes = list(beto.hand)
+
+        for basura in (None, "hola", [], [-1], [99], {"a": 1}):
+            manager.play_card(sids["Beto"], "R8", basura)
+            assert beto.played_card is None, f"{basura!r} no puede contar como jugada"
+            assert list(beto.hand) == antes, f"{basura!r} no puede tocar la mano"
+
+        # Lo mixed: una selección con un elemento bueno y uno basura juega la
+        # buena y se come la basura. Antes esto reventaba con TypeError y el
+        # jugador perdía la jugada entera por un elemento que ni era suyo.
+        manager.play_card(sids["Beto"], "R8", [1, "x"])
+        assert beto.played_card == [antes[1]]
+        assert list(beto.hand) == antes[:1] + antes[2:]
+        assert room.audit_cards() == []
+
+    def test_anadir_cartas_basura_no_tumba_el_handler(self, manager, room_clients):
+        """`add_room_cards` con un `null` en el JSON llegaba a `.split()` y
+        reventaba. Se descarta lo que no sea texto."""
+        clients, sids, room = _start_seq_game(manager, room_clients, "R9", ["Ana", "Beto"])
+        antes = room.deck.size
+        for basura in (None, 42, {"a": 1}, []):
+            manager.add_room_cards("R9", basura)
+        assert room.deck.size == antes
