@@ -121,8 +121,24 @@ def test_tx_sala_drena_aunque_el_cuerpo_lance(gm, sock):
     # Lo encolado antes de la excepción salió igual al salir de la transacción.
     assert len(sock.updates_de(sids[0])) == 1
     assert sock.updates_de(sids[0])[0] == gm.rooms["R1"].to_dict(for_sid=sids[0])
-    # Y el cerrojo de la sala no quedó tomado por el camino.
-    assert not room.lock.locked()
+    # Y el cerrojo de la sala no quedó tomado por el camino. Se comprueba
+    # desde OTRO hilo con `acquire` sin bloqueo: `threading.RLock` no tiene
+    # `locked()` hasta Python 3.14 (en el CI con 3.11 reventaba con
+    # AttributeError), y un `acquire` en este mismo hilo daría falso positivo
+    # porque el RLock es reentrante para quien ya lo posee.
+    import threading
+    estado = {}
+
+    def _sondear():
+        tomado = room.lock.acquire(blocking=False)
+        estado["libre"] = tomado
+        if tomado:
+            room.lock.release()
+
+    sonda = threading.Thread(target=_sondear)
+    sonda.start()
+    sonda.join()
+    assert estado.get("libre"), "el cerrojo de la sala quedó tomado tras la excepción"
 
 
 def test_tx_registro_drena_aunque_el_cuerpo_lance(gm, sock):
