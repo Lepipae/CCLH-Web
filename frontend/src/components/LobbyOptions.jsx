@@ -27,9 +27,10 @@ export default function LobbyOptions({ socket, roomId, options }) {
       <h3 style={{ marginBottom: '1rem', fontSize: '0.9rem', color: 'var(--text-secondary)' }}>⚙️ Opciones de la Sala</h3>
       
       <div className="form-group">
-        <label>Cartas en la mano</label>
-        <input 
-          type="number" 
+        <label htmlFor="lobby-hand-size">Cartas en la mano</label>
+        <input
+          id="lobby-hand-size"
+          type="number"
           min="5" max="20"
           value={handSize}
           onChange={(e) => setHandSize(e.target.value)}
@@ -38,9 +39,10 @@ export default function LobbyOptions({ socket, roomId, options }) {
       </div>
 
       <div className="form-group">
-        <label>Votos para renovar mano (%)</label>
-        <input 
-          type="number" 
+        <label htmlFor="lobby-renew">Votos para renovar mano (%)</label>
+        <input
+          id="lobby-renew"
+          type="number"
           min="10" max="100" step="5"
           value={renewThreshold}
           onChange={(e) => setRenewThreshold(e.target.value)}
@@ -49,8 +51,9 @@ export default function LobbyOptions({ socket, roomId, options }) {
       </div>
 
       <div className="form-group">
-        <label>Orden de turnos (Juez)</label>
-        <select 
+        <label htmlFor="lobby-turn-order">Orden de turnos (Juez)</label>
+        <select
+          id="lobby-turn-order"
           value={turnOrder}
           onChange={(e) => {
             setTurnOrder(e.target.value)

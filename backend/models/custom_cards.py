@@ -40,8 +40,11 @@ volumen montado. Ese "silencio" es intencionado y lo cubre
 """
 import difflib
 import json
+import logging
 import os
 import random
+
+logger = logging.getLogger(__name__)
 
 # Límites de una carta, los MISMOS para el alta manual y para la importación de
 # un set entero. Estaban solo en el importador y por eso el alta manual podía
@@ -77,6 +80,11 @@ class CustomCardsMixin:
         return os.path.abspath(os.path.join(base_dir, "..", "..", "custom_cards"))
 
     def _save_custom_data(self, custom_data):
+        # Persistencia en disco: E/S pura, SIEMPRE fuera de los cerrojos de
+        # juego. Quien llama ya mutó la memoria bajo `_tx_registro` y sale del
+        # lock antes de llegar aquí, así que un disco lento no retiene a
+        # ninguna mesa. El formato no cambia: {"whiteCards": [...],
+        # "blackCards": [{text, pick}]} con el mismo indent de siempre.
         internal_path = self._get_custom_file_path()
         os.makedirs(os.path.dirname(internal_path), exist_ok=True)
         with open(internal_path, 'w', encoding='utf-8') as f:
@@ -88,32 +96,99 @@ class CustomCardsMixin:
             external_path = os.path.join(external_dir, "cartasCustom.json")
             with open(external_path, 'w', encoding='utf-8') as f:
                 json.dump(custom_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("Error exportando cartas a carpeta externa")
+
+    def _resolve_custom_paths(self):
+        """Rutas del archivo de cartas propias y cuál toca leer.
+
+        Se prefiere la interna y se cae a la externa; None si no existe
+        ninguna. Es solo cálculo de rutas (más `os.path.exists`), sin leer
+        nada: la lectura vive en `_load_custom_data`.
+        """
+        custom_path = self._get_custom_file_path()
+        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
+        if os.path.exists(custom_path):
+            target_path = custom_path
+        elif os.path.exists(external_path):
+            target_path = external_path
+        else:
+            target_path = None
+        return custom_path, external_path, target_path
+
+    def _load_custom_data(self):
+        """Lee cartasCustom.json FUERA de cualquier cerrojo de juego.
+
+        Devuelve `(datos, error)`: `datos` es el dict leído (o uno vacío si no
+        hay archivo), y `error` es None en el camino feliz o el mensaje del
+        fallo de parseo si el archivo existe pero no es JSON válido. Quien
+        llama decide: el alta y la importación siguen con un mazo vacío (la
+        corrupción no puede impedir guardar cartas nuevas), mientras que el
+        listado y el borrado la reportan al cliente.
+
+        El formato que devuelve no cambia: {"whiteCards": [...],
+        "blackCards": [...]} tal cual está en disco.
+        """
+        _, _, target_path = self._resolve_custom_paths()
+        if not target_path:
+            return {"whiteCards": [], "blackCards": []}, None
+        try:
+            with open(target_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
         except Exception as e:
-            print("Error exportando cartas a carpeta externa:", e)
+            logger.exception("Error leyendo json custom")
+            return None, str(e)
+        if not isinstance(data, dict):
+            return {"whiteCards": [], "blackCards": []}, None
+        return data, None
 
     def add_custom_card(self, card_type, text, pick, respond_cb):
-        # Transacción completa: muta el mazo global, el archivo y las salas.
-        # El callback se difiere: escribirle al cliente que pregunta es E/S, y
-        # el drena sale al terminar, ya sin ningún cerrojo de juego.
+        # Flujo en tres fases para no hacer E/S con cerrojos tomados:
+        # 1) leer el archivo fuera (I/O, sin lock),
+        # 2) mutar memoria + salas bajo `_tx_registro` (sin I/O),
+        # 3) persistir fuera (I/O, sin lock) y contestar al cliente.
+        # La respuesta de éxito sale DESPUÉS de guardar: contestar antes
+        # mentiría si el disco falla, y los tests de paridad disco lo notan.
+        file_data, _error = self._load_custom_data()
+        if file_data is None:
+            # Archivo corrupto: no puede impedir dar de alta cartas nuevas;
+            # se parte de un mazo vacío y el guardado lo sobrescribe.
+            file_data = {"whiteCards": [], "blackCards": []}
         with self._tx_registro():
-            respond_cb = self._outbox.deferred(respond_cb)
-            self._add_custom_card_locked(card_type, text, pick, respond_cb)
+            diferida = self._outbox.deferred(respond_cb)
+            outcome = self._add_custom_card_locked(card_type, text, pick, file_data, diferida)
+            if outcome is None:
+                # Validación fallida: la respuesta ya quedó encolada y sale al
+                # drenar, sin nada que persistir.
+                return
+            data_to_save, payload = outcome
+        try:
+            self._save_custom_data(data_to_save)
+        except Exception:
+            logger.exception("Error guardando cartas custom")
+            respond_cb({'success': False, 'message': 'Error guardando cartas custom.'})
+            return
+        respond_cb(payload)
 
-    def _add_custom_card_locked(self, card_type, text, pick, respond_cb):
+    def _add_custom_card_locked(self, card_type, text, pick, custom_data, respond_cb):
+        # Solo memoria y cerrojos de sala: el archivo ya viene leído en
+        # `custom_data` y el guardado lo hace quien llama, fuera del lock.
+        # Devuelve (datos_a_guardar, respuesta) en éxito, o None si ya se
+        # contestó un fallo de validación. `custom_data` se muta en sitio.
         if not isinstance(text, str):
             respond_cb({'success': False, 'message': 'El texto no es un texto.'})
-            return
+            return None
         text = text.strip()
         if not text:
             respond_cb({'success': False, 'message': 'El texto está vacío.'})
-            return
+            return None
         if len(text) > MAX_TEXT_LEN:
             respond_cb({'success': False,
                         'message': f'El texto es demasiado largo (máximo {MAX_TEXT_LEN} caracteres).'})
-            return
+            return None
         if card_type not in ('white', 'black'):
             respond_cb({'success': False, 'message': 'Tipo de carta inválido.'})
-            return
+            return None
 
         def check_sim(new_txt, lst, thresh=0.85):
             n_l = new_txt.lower()
@@ -122,24 +197,12 @@ class CustomCardsMixin:
                 if difflib.SequenceMatcher(None, n_l, tc.lower().strip()).ratio() >= thresh:
                     return True, tc
             return False, None
-            
-        custom_path = self._get_custom_file_path()
-        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-        custom_data = {"whiteCards": [], "blackCards": []}
-        
-        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-        if target_path:
-            try:
-                with open(target_path, 'r', encoding='utf-8') as f:
-                    custom_data = json.load(f)
-            except Exception as e:
-                print("Error leyendo json custom:", e)
 
         if card_type == 'white':
             is_sim, match = check_sim(text, self.global_white_cards)
             if is_sim:
                 respond_cb({'success': False, 'message': f'Muy similar a una carta existente: "{match}"'})
-                return
+                return None
             self.global_white_cards.append(text)
             if 'whiteCards' not in custom_data:
                 custom_data['whiteCards'] = []
@@ -159,15 +222,23 @@ class CustomCardsMixin:
             except (TypeError, ValueError):
                 respond_cb({'success': False,
                             'message': 'El número de cartas a elegir no es un número.'})
-                return
+                return None
             if not 1 <= pick <= MAX_PICK:
                 respond_cb({'success': False,
                             'message': f'El número de cartas a elegir debe estar entre 1 y {MAX_PICK}.'})
-                return
+                return None
+            # La misma regla que el importador: una negra pick>=2 necesita al
+            # menos `pick` huecos (_) para ser jugable. Sin esto el alta manual
+            # colaba cartas que el importador habría rechazado y la ronda se
+            # quedaba sin forma de completarse.
+            if pick >= 2 and text.count('_') < pick:
+                respond_cb({'success': False,
+                            'message': f'La carta necesita al menos {pick} guion(es) bajo(s) "_" para pick={pick}.'})
+                return None
             is_sim, match = check_sim(text, self.global_black_cards)
             if is_sim:
                 respond_cb({'success': False, 'message': f'Muy similar a una carta existente: "{match}"'})
-                return
+                return None
             new_c = {'text': text, 'pick': pick}
             self.global_black_cards.append(new_c)
             if 'blackCards' not in custom_data:
@@ -179,51 +250,60 @@ class CustomCardsMixin:
                     random.shuffle(room.available_blacks)
         else:
             respond_cb({'success': False, 'message': 'Tipo de carta inválido.'})
-            return
+            return None
 
-        try:
-            self._save_custom_data(custom_data)
-        except Exception as e:
-            respond_cb({'success': False, 'message': f'Error guardando cartas custom: {str(e)}'})
-            return
-            
-        respond_cb({'success': True, 'whiteCards': custom_data.get('whiteCards', []), 'blackCards': custom_data.get('blackCards', [])})
+        return custom_data, {'success': True,
+                             'whiteCards': custom_data.get('whiteCards', []),
+                             'blackCards': custom_data.get('blackCards', [])}
 
     def get_custom_cards(self, respond_cb):
+        # Solo lectura: el archivo se lee fuera y bajo el lock solo se encola
+        # la respuesta ya serializada, sin I/O dentro.
+        file_data, error = self._load_custom_data()
         with self._tx_registro():
-            respond_cb = self._outbox.deferred(respond_cb)
-            custom_path = self._get_custom_file_path()
-            external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-            target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-
-            if target_path:
-                try:
-                    with open(target_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
-                        return
-                except Exception as e:
-                    respond_cb({'success': False, 'message': str(e)})
-                    return
-            respond_cb({'success': True, 'whiteCards': [], 'blackCards': []})
+            diferida = self._outbox.deferred(respond_cb)
+            if error is not None:
+                diferida({'success': False, 'message': error})
+                return
+            diferida({'success': True,
+                      'whiteCards': file_data.get('whiteCards', []),
+                      'blackCards': file_data.get('blackCards', [])})
 
     def delete_custom_card(self, card_type, text, respond_cb):
-        with self._tx_registro():
-            respond_cb = self._outbox.deferred(respond_cb)
-            self._delete_custom_card_locked(card_type, text, respond_cb)
-
-    def _delete_custom_card_locked(self, card_type, text, respond_cb):
-        custom_path = self._get_custom_file_path()
-        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-        
+        # Tres fases como el alta: leer fuera, mutar bajo lock, guardar fuera.
+        _, _, target_path = self._resolve_custom_paths()
         if not target_path:
-            respond_cb({'success': False, 'message': 'Archivo no encontrado.'})
+            with self._tx_registro():
+                diferida = self._outbox.deferred(respond_cb)
+                diferida({'success': False, 'message': 'Archivo no encontrado.'})
             return
+        file_data, error = self._load_custom_data()
+        if error is not None or file_data is None:
+            with self._tx_registro():
+                diferida = self._outbox.deferred(respond_cb)
+                diferida({'success': False, 'message': error or 'Error leyendo cartas.'})
+            return
+        with self._tx_registro():
+            diferida = self._outbox.deferred(respond_cb)
+            outcome = self._delete_custom_card_locked(card_type, text, file_data, diferida)
+            if outcome is None:
+                return
+            data_to_save, _payload = outcome
         try:
-            with open(target_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
+            self._save_custom_data(data_to_save)
+        except Exception:
+            logger.exception("Error guardando cartas custom")
+            respond_cb({'success': False, 'message': 'Error guardando cartas custom.'})
+            return
+        # La respuesta lleva los datos ya guardados: se emite directa, fuera
+        # de todo cerrojo, igual que el alta.
+        respond_cb(_payload)
+
+    def _delete_custom_card_locked(self, card_type, text, data, respond_cb):
+        # Solo memoria: `data` ya viene leído y el guardado lo hace quien
+        # llama fuera del lock. Devuelve (datos_a_guardar, respuesta), o None
+        # si ya se contestó un fallo.
+        try:
             if card_type == 'white':
                 w_list = data.get('whiteCards', [])
                 data['whiteCards'] = [c for c in w_list if (c if isinstance(c, str) else c.get('text')) != text]
@@ -233,11 +313,15 @@ class CustomCardsMixin:
                 b_list = data.get('blackCards', [])
                 data['blackCards'] = [c for c in b_list if (c if isinstance(c, str) else c.get('text')) != text]
                 self.global_black_cards = [c for c in self.global_black_cards if (c if isinstance(c, str) else c.get('text')) != text]
-            
-            self._save_custom_data(data)
-            respond_cb({'success': True, 'whiteCards': data.get('whiteCards', []), 'blackCards': data.get('blackCards', [])})
+            else:
+                respond_cb({'success': False, 'message': 'Tipo de carta inválido.'})
+                return None
         except Exception as e:
             respond_cb({'success': False, 'message': str(e)})
+            return None
+        return data, {'success': True,
+                      'whiteCards': data.get('whiteCards', []),
+                      'blackCards': data.get('blackCards', [])}
 
     @staticmethod
     def _card_texts(cards):
@@ -248,6 +332,29 @@ class CustomCardsMixin:
             if isinstance(t, str) and t.strip():
                 out.add(t.strip())
         return out
+
+    @staticmethod
+    def _parse_import_payload(raw_json):
+        """Parsea el cuerpo del import fuera de todo cerrojo.
+
+        Es CPU pura (`json.loads` + chequeo de estructura), sin tocar estado ni
+        disco. Devuelve `(datos, error)`: `datos` el dict a validar, o `error`
+        el payload de fallo si el JSON es inválido o no tiene la forma base.
+        """
+        if isinstance(raw_json, dict):
+            data = raw_json  # el cliente también puede enviar el objeto ya parseado
+        elif isinstance(raw_json, list):
+            data = raw_json  # se rechaza abajo por estructura, con su mensaje
+        else:
+            try:
+                data = json.loads(raw_json)
+            except (TypeError, ValueError) as e:
+                return None, {'success': False, 'message': f'JSON inválido: {e}'}
+
+        if not isinstance(data, dict) or ('whiteCards' not in data and 'blackCards' not in data):
+            return None, {'success': False,
+                          'message': 'Estructura no reconocida: se esperaba un objeto con "whiteCards" y/o "blackCards".'}
+        return data, None
 
     def import_custom_cards(self, raw_json, respond_cb):
         """
@@ -261,30 +368,45 @@ class CustomCardsMixin:
         duplicadas (dentro del archivo, en cartasCustom.json o en el mazo base)
         se descartan individualmente; el resto se guarda y se inyecta en el
         mazo global y en las salas activas, igual que add_custom_card.
-        """
-        with self._tx_registro():
-            respond_cb = self._outbox.deferred(respond_cb)
-            self._import_custom_cards_locked(raw_json, respond_cb)
 
-    def _import_custom_cards_locked(self, raw_json, respond_cb):
+        Tres fases, sin E/S bajo cerrojos: parsear + leer fuera, mutar bajo
+        `_tx_registro`, persistir fuera y contestar.
+        """
+        # 1) Fuera del lock: parsear el cuerpo y leer el archivo (I/O).
+        data, error = self._parse_import_payload(raw_json)
+        if error is not None:
+            respond_cb(error)
+            return
+        file_data, _load_error = self._load_custom_data()
+        if file_data is None:
+            # Archivo corrupto: no bloquea la importación; se parte de vacío
+            # y el guardado lo sobrescribe (ver test_import_survives...).
+            file_data = {"whiteCards": [], "blackCards": []}
+        # 2) Bajo el lock: validar contra el mazo, fusionar e inyectar.
+        with self._tx_registro():
+            diferida = self._outbox.deferred(respond_cb)
+            outcome = self._import_custom_cards_locked(data, file_data, diferida)
+            if outcome is None:
+                # Nada válido que importar: la respuesta ya quedó encolada.
+                return
+            data_to_save, payload = outcome
+        # 3) Fuera del lock: persistir y contestar con lo ya guardado.
+        try:
+            self._save_custom_data(data_to_save)
+        except Exception:
+            logger.exception("Error guardando cartas custom")
+            respond_cb({'success': False, 'message': 'Error guardando cartas custom.'})
+            return
+        respond_cb(payload)
+
+    def _import_custom_cards_locked(self, data, file_data, respond_cb):
 
         MAX_DETAILS = 10     # ejemplos de rechazo/omisión devueltos al cliente
         # MAX_TEXT_LEN y MAX_PICK son de módulo: los comparte con el alta manual.
-
-        # 1) Parsear el JSON crudo y exigir la estructura del formato base
-        if isinstance(raw_json, (dict, list)):
-            data = raw_json  # el cliente también puede enviar el objeto ya parseado
-        else:
-            try:
-                data = json.loads(raw_json)
-            except (TypeError, ValueError) as e:
-                respond_cb({'success': False, 'message': f'JSON inválido: {e}'})
-                return
-
-        if not isinstance(data, dict) or ('whiteCards' not in data and 'blackCards' not in data):
-            respond_cb({'success': False,
-                        'message': 'Estructura no reconocida: se esperaba un objeto con "whiteCards" y/o "blackCards".'})
-            return
+        # Solo memoria y cerrojos de sala: `data` ya viene parseado y
+        # `file_data` ya viene leído; el guardado lo hace quien llama fuera.
+        # Devuelve (datos_a_guardar, respuesta), o None si ya se contestó que
+        # no había nada válido que importar.
 
         def clean_text(value):
             """Texto listo para guardar, o None si no es válido como carta."""
@@ -386,19 +508,11 @@ class CustomCardsMixin:
                         'message': f'Ninguna carta válida para importar ({n_rejected} inválidas, {n_ignored} duplicadas).',
                         'rejected': rejected,
                         'ignored': ignored})
-            return
+            return None
 
-        # 4) Fusionar con cartasCustom.json y guardar (ruta interna + externa)
-        custom_path = self._get_custom_file_path()
-        external_path = os.path.join(self._get_external_custom_dir(), "cartasCustom.json")
-        target_path = custom_path if os.path.exists(custom_path) else (external_path if os.path.exists(external_path) else None)
-        custom_data = {"whiteCards": [], "blackCards": []}
-        if target_path:
-            try:
-                with open(target_path, 'r', encoding='utf-8') as f:
-                    custom_data = json.load(f)
-            except Exception as e:
-                print("Error leyendo json custom:", e)
+        # 4) Fusionar con cartasCustom.json en memoria (ya leído fuera del
+        # lock) y dejar el guardado para quien llama, fuera del lock.
+        custom_data = file_data
         if not isinstance(custom_data, dict):
             custom_data = {"whiteCards": [], "blackCards": []}
 
@@ -411,13 +525,9 @@ class CustomCardsMixin:
             if b['text'] not in file_blacks:
                 custom_data.setdefault('blackCards', []).append(b)
 
-        try:
-            self._save_custom_data(custom_data)
-        except Exception as e:
-            respond_cb({'success': False, 'message': f'Error guardando cartas custom: {e}'})
-            return
-
-        # 5) Inyectar en el mazo global y en las salas activas (en directo)
+        # 5) Inyectar en el mazo global y en las salas activas (en directo).
+        # Es memoria + cerrojos de sala (registro -> sala, el orden bueno),
+        # sin disco: el guardado lo hace quien llama al salir del lock.
         self.global_white_cards.extend(new_whites)
         self.global_black_cards.extend(new_blacks)
         for room in self.rooms.values():
@@ -428,11 +538,11 @@ class CustomCardsMixin:
                     room.available_blacks.extend(new_blacks)
                     random.shuffle(room.available_blacks)
 
-        respond_cb({'success': True,
-                    'imported': {'white': len(new_whites), 'black': len(new_blacks)},
-                    'rejected_count': n_rejected,
-                    'ignored_count': n_ignored,
-                    'rejected': rejected,
-                    'ignored': ignored,
-                    'whiteCards': custom_data.get('whiteCards', []),
-                    'blackCards': custom_data.get('blackCards', [])})
+        return custom_data, {'success': True,
+                             'imported': {'white': len(new_whites), 'black': len(new_blacks)},
+                             'rejected_count': n_rejected,
+                             'ignored_count': n_ignored,
+                             'rejected': rejected,
+                             'ignored': ignored,
+                             'whiteCards': custom_data.get('whiteCards', []),
+                             'blackCards': custom_data.get('blackCards', [])}

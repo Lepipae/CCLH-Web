@@ -33,6 +33,19 @@ def _start_seq_game(manager, room_clients, room_id, names, hand_size=None):
     return clients, sids, room
 
 
+def _pick_de(room):
+    """Cuántas cartas pide la negra en mesa (1 si no es un dict con pick)."""
+    bc = room.black_card
+    return bc.get('pick', 1) if isinstance(bc, dict) else 1
+
+
+def _jugar(manager, sid, room_id, room):
+    """Jugada legal por el protocolo real del cliente: exactamente las cartas
+    que pide la negra en mesa. El servidor exige el recuento exacto (`pick`),
+    así que jugar un `0` fijo solo vale para negras pick=1."""
+    manager.play_card(sid, room_id, list(range(_pick_de(room))))
+
+
 # --- El mazo por dentro ------------------------------------------------------
 
 class TestDeckUnit:
@@ -182,15 +195,15 @@ class TestRoomDeck:
 
     def test_room_audit_covers_hands_and_submissions(self, manager, room_clients):
         clients, sids, room = _start_seq_game(manager, room_clients, "D2", ["Ana", "Beto", "Caro"])
-        manager.play_card(sids["Beto"], "D2", 0)
-        manager.play_card(sids["Caro"], "D2", 0)  # judging, dos submissions
+        _jugar(manager, sids["Beto"], "D2", room)
+        _jugar(manager, sids["Caro"], "D2", room)  # judging, dos submissions
         assert room.state == "judging"
         assert room.audit_cards() == []
 
     def test_revealing_and_choosing_a_winner_keeps_the_cards(self, manager, room_clients):
         clients, sids, room = _start_seq_game(manager, room_clients, "D3", ["Ana", "Beto", "Caro"])
-        manager.play_card(sids["Beto"], "D3", 0)
-        manager.play_card(sids["Caro"], "D3", 0)
+        _jugar(manager, sids["Beto"], "D3", room)
+        _jugar(manager, sids["Caro"], "D3", room)
         czar = room.czar
         manager.reveal_card(czar, "D3", room.played_cards[0]["id"])
         manager.choose_winner(czar, "D3", room.played_cards[0]["id"])
@@ -211,7 +224,7 @@ class TestConservationOfARealGame:
         czar = room.czar
         for sid in sids.values():
             if sid != czar:
-                manager.play_card(sid, room_id, 0)
+                _jugar(manager, sid, room_id, room)
         assert room.state == "judging"
         manager.choose_winner(czar, room_id, room.played_cards[0]["id"])
         assert room.state == "round_end"
@@ -235,8 +248,8 @@ class TestConservationOfARealGame:
         al hacer `played_cards = []`. Una carta destruida por cada desconectado
         que hubiera jugado."""
         clients, sids, room = _start_seq_game(manager, room_clients, "R2", ["Ana", "Beto", "Caro"])
-        manager.play_card(sids["Beto"], "R2", 0)
-        manager.play_card(sids["Caro"], "R2", 0)
+        _jugar(manager, sids["Beto"], "R2", room)
+        _jugar(manager, sids["Caro"], "R2", room)
         assert len(room.played_cards) == 2
 
         manager.disconnect(sids["Beto"])       # se va DESPUÉS de jugar
@@ -268,7 +281,7 @@ class TestConservationOfARealGame:
         """Purgar un zombi tampoco puede dejar cartas en un asiento muerto: la
         mano vuelve al mazo al liberar el asiento."""
         clients, sids, room = _start_seq_game(manager, room_clients, "R4", ["Ana", "Beto", "Caro"], hand_size=4)
-        manager.play_card(sids["Beto"], "R4", 0)
+        _jugar(manager, sids["Beto"], "R4", room)
 
         # Beto es un zombi real: contestó latidos y luego se congeló
         clients["Beto"].emit("heartbeat_pong")
@@ -324,6 +337,9 @@ class TestConservationOfARealGame:
         pero el servidor no se fía: jugaba la misma carta dos veces y sacaba dos
         cartas de la mano, y la segunda se perdía del sistema para siempre."""
         clients, sids, room = _start_seq_game(manager, room_clients, "R7", ["Ana", "Beto"], hand_size=5)
+        # Negra pick=1 fijada: este test comprueba la deduplicación con una
+        # jugada de UNA carta, y el servidor exige el recuento exacto del pick.
+        room.black_card = {"text": "Negra de prueba _", "pick": 1}
         beto = room.players[sids["Beto"]]
         antes = len(beto.hand)
 
@@ -339,6 +355,9 @@ class TestConservationOfARealGame:
         comparación) ni devolver una jugada a medias. Con el cerrojo de la sala
         tomado, una excepción ahí se lleva por delante la partida entera."""
         clients, sids, room = _start_seq_game(manager, room_clients, "R8", ["Ana", "Beto"], hand_size=5)
+        # Negra pick=1 fijada: la parte "mixta" del test juega UNA carta buena,
+        # y con otro pick el servidor la rechazaría por recuento inexacto.
+        room.black_card = {"text": "Negra de prueba _", "pick": 1}
         beto = room.players[sids["Beto"]]
         antes = list(beto.hand)
 

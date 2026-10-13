@@ -12,3 +12,7 @@ cartasCustom.json
 __pycache__/
 *.pyc
 .freebuff/project-id
+
+.agents/
+.freebuff/
+skills-lock.json

@@ -1,8 +1,23 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "oxc"],
+  // oxlint ya incluye reglas jsx-a11y sin plugin extra (eslint-plugin-jsx-a11y
+  // no se instala: oxlint lo implementa nativo vía `plugins: ["jsx_a11y"]`).
+  // Se activan las que cubren este repo: interactive con teclado, labels
+  // asociados, alt/texto accesible y roles válidos. `no-autofocus` queda en
+  // warn porque el modal de borrado lo usa a propósito para mover el foco.
+  "plugins": ["jsx_a11y", "react", "oxc"],
   "rules": {
     "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+    "react/only-export-components": ["warn", { "allowConstantExport": true }],
+    "jsx-a11y/click-events-have-key-events": "error",
+    "jsx-a11y/no-static-element-interactions": "error",
+    "jsx-a11y/interactive-supports-focus": "error",
+    "jsx-a11y/label-has-associated-control": "error",
+    "jsx-a11y/no-autofocus": "warn",
+    "jsx-a11y/no-noninteractive-element-interactions": "warn",
+    "jsx-a11y/alt-text": "error",
+    "jsx-a11y/aria-props": "error",
+    "jsx-a11y/aria-role": "error",
+    "jsx-a11y/tabindex-no-positive": "error"
   }
 }

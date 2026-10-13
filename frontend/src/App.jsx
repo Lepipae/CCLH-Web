@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
+import { X } from 'lucide-react'
 import Login from './components/Login'
 import GameScreen from './components/GameScreen'
 import CardWorkshop from './components/CardWorkshop'
-
-const socket = io()
+import './components/CardWorkshop.css'
 
 // Avisos de presencia que se muestran en la cabecera. Se guardan los últimos
 // pocos porque interesa el orden de llegada y se caen solos tras un rato:
@@ -12,8 +12,13 @@ const socket = io()
 // lleva su `presence`), así que perder un aviso es solo no ver una línea.
 const MAX_AVISOS = 4
 const VIDA_AVISO_MS = 9000
+const VIDA_TOAST_MS = 5000
 
 function App() {
+  // El socket se crea una sola vez por montaje (useMemo []) y se desconecta
+  // al desmontar: antes vivía a nivel de módulo (`const socket = io()`), así
+  // que sobrevivía a HMR/tests y duplicaba listeners y conexiones.
+  const socket = useMemo(() => io(), [])
   const [inGame, setInGame] = useState(false)
   const [gameState, setGameState] = useState(null)
   const [mySid, setMySid] = useState(null)
@@ -28,9 +33,19 @@ function App() {
   // cual lo envía el reto: el estado de MI presencia está en la foto, pero el
   // plazo (que es una promesa con fecha) solo llega en el evento.
   const [miGracia, setMiGracia] = useState(null)
+  // Toast no bloqueante que sustituye a alert(): los errores de sala y la
+  // purga del propio asiento se anuncian sin congelar el hilo.
+  const [toast, setToast] = useState(null) // { message, kind }
+  const toastTimer = useRef(null)
+
+  const showToast = (message, kind = 'error') => {
+    setToast({ message, kind })
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(null), VIDA_TOAST_MS)
+  }
 
   useEffect(() => {
-    socket.on('connect', () => {
+    const handleConnect = () => {
       setMySid(socket.id)
       // socket.io reconecta solo, y al hacerlo el sid cambia: para el servidor
       // este jugador es uno nuevo. Si no reentramos, el asiento anterior se
@@ -39,9 +54,9 @@ function App() {
       if (lastJoin.current) {
         socket.emit('join_game', lastJoin.current)
       }
-    })
+    }
 
-    socket.on('game_update', (data) => {
+    const handleGameUpdate = (data) => {
       setGameState(data)
       setInGame(true)
       setView('game')
@@ -53,21 +68,21 @@ function App() {
         if (p.presence) siguiente[p.id] = { ...p.presence, name: p.name }
       }
       setPresencia(siguiente)
-    })
+    }
 
-    socket.on('join_error', (data) => {
-      alert(data.message)
+    const handleJoinError = (data) => {
+      showToast(data.message || 'No se pudo entrar en la sala.', 'error')
       setInGame(false)
       setView('login')
-    })
+    }
 
     // El servidor emite 'heartbeat_ping' cada ROOM_REAP_INTERVAL s y espera
     // esta respuesta como prueba de que hay alguien leyendo al otro lado. Sin
     // ella, un socket que se cae sin 'disconnect' (típico detrás de ngrok)
     // deja el asiento ocupado para siempre.
-    socket.on('heartbeat_ping', () => {
+    const handleHeartbeatPing = () => {
       socket.emit('heartbeat_pong')
-    })
+    }
 
     // --- Presencia en dos fases (vivo / sospechoso / purgado) -------------
     // `presence_alert` es el aviso a la mesa: entra alguien en periodo de
@@ -77,7 +92,7 @@ function App() {
     // foto de la sala también lo trae, pero la foto solo llega cuando cambia
     // algo del juego, y una sospecha no cambia nada del juego: sin esto, en un
     // lobby en calma el ⚠️ no aparecería hasta que alguien jugara una carta.
-    socket.on('presence_alert', (data) => {
+    const handlePresenceAlert = (data) => {
       setPresencia(prev => {
         if (data.state === 'purgado') {
           // Se va de la sala: fuera del mapa, que la foto ya no listará.
@@ -102,42 +117,57 @@ function App() {
         ...prev,
       ].slice(0, MAX_AVISOS))
       if (data.state === 'vivo') setMiGracia(null)
-      // Si el liberado soy YO, el servidor ya me ha quitado el asiento: la        // partida que se está pintando ya no es la mía y todos sus botones van a
-        // ser rechazados. Sin esto, el cliente se queda mirando una mesa muerta sin
+      // Si el liberado soy YO, el servidor ya me ha quitado el asiento: la
+      // partida que se está pintando ya no es la mía y todos sus botones van a
+      // ser rechazados. Sin esto, el cliente se queda mirando una mesa muerta sin
       // salida, porque no hay ningún botón de "salir" en la partida. Se vuelve
       // al login, que es donde se puede volver a entrar.
       //
       // Se compara con `socket.id` y no con el estado `mySid` porque este
-      // listener se registra una vez (deps []) y cualquier `mySid` capturado
-      // aquí se quedaría en su valor inicial para siempre.
+      // listener se registra una vez (deps [socket]) y cualquier `mySid`
+      // capturado aquí se quedaría en su valor inicial para siempre.
       if (data.state === 'purgado' && data.sid === socket.id) {
-        alert(data.name
-          ? `Se ha liberado tu asiento (${data.name} dejó de responder). Vuelve a entrar para seguir jugando.`
-          : 'Se ha liberado tu asiento. Vuelve a entrar para seguir jugando.')
+        showToast(
+          data.name
+            ? `Se ha liberado tu asiento (${data.name} dejó de responder). Vuelve a entrar para seguir jugando.`
+            : 'Se ha liberado tu asiento. Vuelve a entrar para seguir jugando.',
+          'info',
+        )
         lastJoin.current = null
         setInGame(false)
         setView('login')
       }
-    })
+    }
 
     // `presence_challenge` es el reto explícito: "si estás ahí, contesta". Se
     // contesta con el mismo pong de siempre, pero aquí con una intención clara
     // (es lo que devuelve el asiento dentro del periodo de gracia), así que
     // además se guarda el plazo para poder mostrar la cuenta atrás.
-    socket.on('presence_challenge', (data) => {
+    const handlePresenceChallenge = (data) => {
       socket.emit('heartbeat_pong')
       setMiGracia({ grace: data.grace, left: data.left })
-    })
+    }
+
+    socket.on('connect', handleConnect)
+    socket.on('game_update', handleGameUpdate)
+    socket.on('join_error', handleJoinError)
+    socket.on('heartbeat_ping', handleHeartbeatPing)
+    socket.on('presence_alert', handlePresenceAlert)
+    socket.on('presence_challenge', handlePresenceChallenge)
 
     return () => {
-      socket.off('connect')
-      socket.off('game_update')
-      socket.off('join_error')
-      socket.off('heartbeat_ping')
-      socket.off('presence_alert')
-      socket.off('presence_challenge')
+      socket.off('connect', handleConnect)
+      socket.off('game_update', handleGameUpdate)
+      socket.off('join_error', handleJoinError)
+      socket.off('heartbeat_ping', handleHeartbeatPing)
+      socket.off('presence_alert', handlePresenceAlert)
+      socket.off('presence_challenge', handlePresenceChallenge)
+      // Limpieza completa: sin esto, un desmontaje (tests, HMR) deja la
+      // conexión abierta y los listeners vivos, duplicando game_updates.
+      if (toastTimer.current) clearTimeout(toastTimer.current)
+      socket.disconnect()
     }
-  }, [])
+  }, [socket])
 
   // Los avisos se caen solos: sin esto, la cabecera acumularía líneas de hace
   // media hora de gente que ya se fue.
@@ -152,28 +182,48 @@ function App() {
     socket.emit('join_game', lastJoin.current)
   }
 
+  const toastView = toast && (
+    <div className={`app-toast app-toast-${toast.kind}`} role="alert">
+      <span>{toast.message}</span>
+      <button type="button" onClick={() => setToast(null)} aria-label="Cerrar aviso">
+        <X size={16} />
+      </button>
+    </div>
+  )
+
   if (view === 'workshop') {
-    return <CardWorkshop socket={socket} onBack={() => setView('login')} />
+    return (
+      <>
+        {toastView}
+        <CardWorkshop socket={socket} onBack={() => setView('login')} />
+      </>
+    )
   }
 
   if (view === 'game' && inGame && gameState) {
     return (
-      <GameScreen 
-        gameState={gameState} 
-        mySid={mySid} 
-        socket={socket}
-        presencia={presencia}
-        avisos={avisos}
-        miGracia={miGracia}
-      />
+      <>
+        {toastView}
+        <GameScreen
+          gameState={gameState}
+          mySid={mySid}
+          socket={socket}
+          presencia={presencia}
+          avisos={avisos}
+          miGracia={miGracia}
+        />
+      </>
     )
   }
 
   return (
-    <Login 
-      onJoin={handleJoin} 
-      onOpenWorkshop={() => setView('workshop')} 
-    />
+    <>
+      {toastView}
+      <Login
+        onJoin={handleJoin}
+        onOpenWorkshop={() => setView('workshop')}
+      />
+    </>
   )
 }
 

@@ -187,6 +187,14 @@ def _politica(manager, monkeypatch, sospecha, gracia, atributo='PRESENCE'):
     monkeypatch.setattr(manager, atributo, PresencePolicy(sospecha, gracia))
 
 
+def _jugar(manager, sid, room_id, room):
+    """Jugada legal por el protocolo real del cliente: exactamente las cartas
+    que pide la negra en mesa (el servidor exige el recuento exacto del pick)."""
+    bc = room.black_card
+    pick = bc.get('pick', 1) if isinstance(bc, dict) else 1
+    manager.play_card(sid, room_id, list(range(pick)))
+
+
 def _eventos(cliente, evento):
     return [e['args'][0] for e in cliente.get_received() if e['name'] == evento]
 
@@ -432,7 +440,7 @@ class TestReaperEnDosFases:
         manager.reap_empty_rooms()
         # La sospecha no emite game_update (el juego no ha cambiado): lo que lo
         # demuestra es la siguiente difusión de verdad, la de Beto jugando.
-        manager.play_card(sids["Beto"], "P8", 0)
+        _jugar(manager, sids["Beto"], "P8", room)
 
         updates = [e['args'][0] for e in ana.get_received() if e['name'] == 'game_update']
         beto = next(p for p in updates[-1]['players'] if p['id'] == sids['Beto'])

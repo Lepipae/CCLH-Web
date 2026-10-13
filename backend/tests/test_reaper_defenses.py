@@ -77,6 +77,14 @@ def _start_seq_game(manager, room_clients, room_id, names):
     return clients, sids, room
 
 
+def _jugar(manager, sid, room_id, room):
+    """Jugada legal por el protocolo real del cliente: exactamente las cartas
+    que pide la negra en mesa (el servidor exige el recuento exacto del pick)."""
+    bc = room.black_card
+    pick = bc.get('pick', 1) if isinstance(bc, dict) else 1
+    manager.play_card(sid, room_id, list(range(pick)))
+
+
 # --- Brainstorm #3: invariante de conservación de cartas ---------------------
 
 # --- Brainstorm #4: purga de jugadores zombi ---------------------------------
@@ -114,7 +122,7 @@ class TestZombieReaper:
         _answer_heartbeats(room)
 
         # Actividad reciente para todos (la difusión NO cuenta como señal de vida)
-        manager.play_card(sids["Bob"], "Z2", 0)
+        _jugar(manager, sids["Bob"], "Z2", room)
         for p in room.players.values():
             p.last_seen = time.time()  # refresco explícito de los tres
 
@@ -243,7 +251,7 @@ class TestHeartbeatIsTheOnlyLivenessSignal:
         _set_politica(manager, monkeypatch, 300, 0)  # sospecha pronta, sin margen
         _go_silent(room)  # los tres se quedaron congelados
 
-        manager.play_card(sids["Bob"], "H4", 0)  # difusión a los tres
+        _jugar(manager, sids["Bob"], "H4", room)  # difusión a los tres
 
         manager.reap_empty_rooms()
         assert all(p.presence.state == SOSPECHOSO for p in room.players.values()), \
@@ -627,7 +635,12 @@ class TestAsientoPurgadoNoManda:
         assert room.asiento(ana) is not None
         mano_ana = len(room.players[ana].hand)
 
-        clients["Beto"].emit("play_card", {"room_id": "A6", "card_index": 0})
+        # Selección exacta del pick en mesa (el servidor exige el recuento
+        # exacto): un `0` fijo solo jugaría con negras pick=1.
+        bc = room.black_card
+        pick = bc.get('pick', 1) if isinstance(bc, dict) else 1
+        clients["Beto"].emit("play_card", {"room_id": "A6",
+                                           "card_index": list(range(pick))})
 
         assert len(room.played_cards) == 1
         assert room.played_cards[0]['sid'] == sids["Beto"]

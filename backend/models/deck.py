@@ -14,8 +14,43 @@ submissions de la ronda son solo "dónde están ahora", y `audit()` reconcilia l
 tres ubicaciones **por identidad de carta**, no por cantidad: con dos cartas de
 texto idéntico, contar no puede decir cuál se perdió, pero los ids sí.
 """
+import logging
 import random
 import uuid
+
+# Límite de texto de una carta blanca, el MISMO que usa el alta manual y el
+# importador (models/custom_cards.py::MAX_TEXT_LEN). Estaba solo allí y el mazo
+# aceptaba cualquier cosa que le inyectaran, incluidas cadenas de un megabyte
+# que luego viajaban a cada cliente que jugaba esa carta.
+MAX_TEXT_LEN = 200
+
+logger = logging.getLogger(__name__)
+
+
+def _texto_valido(texto):
+    """Texto listo para entrar al mazo, o None si no vale como carta blanca.
+
+    Misma regla que el importador y el alta manual (ver custom_cards.py y la
+    matriz BASE_SET de tests/conftest.py): tiene que ser texto de verdad (un
+    `12345` numérico no es una carta), no vacío tras recortar, no puramente
+    numérico (una carta de solo dígitos no es jugable) y de como mucho
+    MAX_TEXT_LEN caracteres. Devolver None en vez de lanzar permite que
+    `inject` descarte carta a carta sin tumbar la inyección entera.
+    """
+    if not isinstance(texto, str):
+        return None
+    texto = texto.strip()
+    if not texto or len(texto) > MAX_TEXT_LEN:
+        return None
+    # Numérica pura ("12345"): no es una carta, es un resto del scraper.
+    # Se prueba con float para cazar también "3.14" o "-5", pero sin tumbar
+    # textos normales ("200 gramos de heroína..." no es un número).
+    try:
+        float(texto)
+        return None
+    except (TypeError, ValueError):
+        pass
+    return texto
 
 
 class Card(str):
@@ -83,6 +118,13 @@ class Deck:
         """Reparte `count` cartas del mazo. Si no hay suficientes devuelve `[]`:
         es mejor repartir de menos que perder cartas."""
         if count <= 0 or len(self._pool) < count:
+            # No es silencioso: una mano corta es síntoma de mazo vaciado
+            # (fuga de cartas o sala con más jugadores que mazo), y sin esta
+            # línea solo se veía como "no me llegan cartas".
+            if count > 0:
+                logger.warning(
+                    "Reparto corto: se pidieron %d cartas y solo hay %d en el mazo (%s)",
+                    count, len(self._pool), self.summary())
             return []
         drawn = random.sample(self._pool, count)
         for card_id in drawn:
@@ -103,6 +145,13 @@ class Deck:
                 # Vuelve una carta que el mazo no conocía: la damos de alta en
                 # vez de perderla, y `audit` seguirá viéndola.
                 self._cards[card_id] = card
+            if card_id in self._pool:
+                # Doble devolución de la misma carta (renovar dos veces, revert
+                # tras renew, etc.): ya está en el mazo y volver a meterla la
+                # duplicaría, que es justo lo que `audit` existe para cazar.
+                logger.warning(
+                    "Doble devolución ignorada: la carta %s ya está en el mazo", card_id)
+                continue
             self._pool.append(card_id)
 
     def inject(self, texts):
@@ -110,9 +159,14 @@ class Deck:
         Devuelve cuántas se han añadido."""
         added = 0
         for text in texts:
-            if text is None or (isinstance(text, str) and not str(text).strip()):
+            # Misma validación que el alta manual y el importador: fuera
+            # vacías, no-texto, numéricas y desmedidas. Antes solo se filtraban
+            # las vacías y una carta de un megabyte (o un `12345` del scraper)
+            # entraba directa al mazo de una sala viva.
+            valido = _texto_valido(text if isinstance(text, str) else text)
+            if valido is None:
                 continue
-            self._register(text)
+            self._register(text if isinstance(text, Card) else valido)
             added += 1
         if added:
             self.shuffle()

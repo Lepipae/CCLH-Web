@@ -76,6 +76,19 @@ def sub_of(room, sid):
     raise AssertionError(f"{sid} no tiene carta en juego")
 
 
+def _pick_de(room):
+    """Cuántas cartas pide la negra en mesa (1 si no es un dict con pick)."""
+    bc = room.black_card
+    return bc.get('pick', 1) if isinstance(bc, dict) else 1
+
+
+def _jugar(m, sid, room_id, room):
+    """Jugada legal por el protocolo real del cliente: exactamente las cartas
+    que pide la negra en mesa. El servidor exige el recuento exacto (`pick`),
+    así que un `0` fijo solo vale para negras pick=1."""
+    m.play_card(sid, room_id, list(range(_pick_de(room))))
+
+
 class TestLeaderHandoff:
     def test_waiting_room_leader_promotes_a_connected_player(self, app_module, room_clients):
         room_clients("Alice", "LW1")
@@ -131,8 +144,8 @@ class TestCzarHandoff:
     def test_czar_disconnect_mid_judging_passes_to_a_player(self, app_module, room_clients):
         sids, room = start_seq_game(app_module, room_clients, "CJ1", ["Alice", "Bob", "Carol"])
         m = app_module.manager
-        m.play_card(sids["Bob"], "CJ1", 0)
-        m.play_card(sids["Carol"], "CJ1", 0)
+        _jugar(m, sids["Bob"], "CJ1", room)
+        _jugar(m, sids["Carol"], "CJ1", room)
         assert room.state == "judging"
 
         m.disconnect(sids["Alice"])  # la jueza se marcha con las cartas sin revelar
@@ -150,7 +163,7 @@ class TestCzarHandoff:
     def test_czar_disconnect_mid_playing_keeps_round_alive(self, app_module, room_clients):
         sids, room = start_seq_game(app_module, room_clients, "CJ2", ["Alice", "Bob", "Carol"])
         m = app_module.manager
-        m.play_card(sids["Bob"], "CJ2", 0)
+        _jugar(m, sids["Bob"], "CJ2", room)
         assert room.state == "playing"
 
         m.disconnect(sids["Alice"])
@@ -159,7 +172,7 @@ class TestCzarHandoff:
         assert room.state == "playing"
         assert len(room.played_cards) == 1  # la submission de Bob sigue en juego
 
-        m.play_card(sids["Carol"], "CJ2", 0)
+        _jugar(m, sids["Carol"], "CJ2", room)
         assert room.state == "judging"
         m.choose_winner(sids["Bob"], "CJ2", sub_of(room, sids["Carol"])["id"])
         assert room.state == "round_end"
@@ -175,7 +188,7 @@ class TestCzarHandoff:
         assert room.czar == sids["Bob"]
         assert room.leader == sids["Bob"]
 
-        m.play_card(sids["Carol"], "CJ3", 0)
+        _jugar(m, sids["Carol"], "CJ3", room)
         assert room.state == "judging"
         m.choose_winner(sids["Bob"], "CJ3", sub_of(room, sids["Carol"])["id"])
         m.force_next_round(sids["Bob"], "CJ3")
@@ -189,12 +202,15 @@ class TestCzarHandoff:
         espectadoras entran al juego y la ronda vuelve a 'playing'."""
         sids, room = start_seq_game(app_module, room_clients, "CJ4", ["Alice", "Bob", "Carol"])
         m = app_module.manager
-        m.play_card(sids["Bob"], "CJ4", 0)
-        m.play_card(sids["Carol"], "CJ4", 0)
+        _jugar(m, sids["Bob"], "CJ4", room)
+        _jugar(m, sids["Carol"], "CJ4", room)
         assert room.state == "judging"
         room_clients("Dave", "CJ4")   # espectadoras de respaldo
         room_clients("Eve", "CJ4")
         pool = room.deck.count()
+        # Cartas en juego AHORA (cada submission lleva `pick` cartas, y la negra
+        # es aleatoria): es lo que tiene que volver al mazo al descartarse.
+        en_juego = sum(len(c["cards"]) for c in room.played_cards)
 
         m.disconnect(sids["Bob"])     # las dos submissiones quedan huérfanas
         m.disconnect(sids["Carol"])
@@ -206,7 +222,7 @@ class TestCzarHandoff:
         assert room.played_cards == []
         # Las cartas de las dos submissiones descartadas vuelven al mazo
         # (las espectadoras ya habían recibido su mano al entrar)
-        assert room.deck.count() == pool + 2
+        assert room.deck.count() == pool + en_juego
         assert room.players[sids["Bob"]].played_card is None
         dave = sid_of(room, "Dave")
         assert room.czar == dave
@@ -274,8 +290,8 @@ class TestWinnerRotation:
     def test_choose_winner_rejects_disconnected_submission(self, app_module, room_clients):
         sids, room = start_seq_game(app_module, room_clients, "W1", ["Alice", "Bob", "Carol"])
         m = app_module.manager
-        m.play_card(sids["Bob"], "W1", 0)
-        m.play_card(sids["Carol"], "W1", 0)
+        _jugar(m, sids["Bob"], "W1", room)
+        _jugar(m, sids["Carol"], "W1", room)
         assert room.state == "judging"
 
         m.disconnect(sids["Bob"])
@@ -294,8 +310,8 @@ class TestWinnerRotation:
         sids, room = start_seq_game(app_module, room_clients, "W2", ["Alice", "Bob", "Carol"])
         room.options["turn_order"] = "winner"  # el ganador pasa a juez: el caso que se congelaba
         m = app_module.manager
-        m.play_card(sids["Bob"], "W2", 0)
-        m.play_card(sids["Carol"], "W2", 0)
+        _jugar(m, sids["Bob"], "W2", room)
+        _jugar(m, sids["Carol"], "W2", room)
         m.choose_winner(sids["Alice"], "W2", sub_of(room, sids["Bob"])["id"])
         assert room.state == "round_end"
         assert room.last_winner == sids["Bob"]
@@ -335,8 +351,8 @@ class TestHealOnJoin:
     def test_join_heals_round_end_stuck_without_czar(self, app_module, room_clients):
         sids, room = start_seq_game(app_module, room_clients, "H3", ["Alice", "Bob", "Carol"])
         m = app_module.manager
-        m.play_card(sids["Bob"], "H3", 0)
-        m.play_card(sids["Carol"], "H3", 0)
+        _jugar(m, sids["Bob"], "H3", room)
+        _jugar(m, sids["Carol"], "H3", room)
         m.choose_winner(sids["Alice"], "H3", sub_of(room, sids["Bob"])["id"])
         assert room.state == "round_end"
         black_before = room.black_card
@@ -424,8 +440,8 @@ class TestReconnection:
         m.advance_to_next_round("R1")
         assert room.czar == bob2
 
-        m.play_card(sids["Alice"], "R1", 0)
-        m.play_card(sids["Carol"], "R1", 0)
+        _jugar(m, sids["Alice"], "R1", room)
+        _jugar(m, sids["Carol"], "R1", room)
         assert room.state == "judging"
         m.choose_winner(bob2, "R1", sub_of(room, sids["Alice"])["id"])
         assert room.state == "round_end"

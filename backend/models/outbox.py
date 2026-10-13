@@ -52,9 +52,15 @@ Lo que este módulo garantiza (ver tests/test_emit_locking.py):
 
 Sobre `add_update` y los números de versión: se asignan bajo el cerrojo de la
 sala a la que pertenecen, que es lo que serializa las difusiones de una misma
-mesa. `last_emitted` se compara bajo el cerrojo del CANAL, al drenar y sin
+mesa. `last_emitted` se guarda POR DESTINATARIO (sid -> última versión que se
+le entregó) y se compara bajo el cerrojo del CANAL, al drenar y sin
 ningún cerrojo de juego. Que la asignación y la comparación ocurran bajo
-cerrojos distintos es seguro porque las versiones solo crecen.
+cerrojos distintos es seguro porque las versiones solo crecen. El descarte
+tiene que ser por sid y no global: las versiones salen de un contador ÚNICO
+del canal (cada `add_update` consume una, sea para quien sea), así que comparar
+la versión de un jugador contra el máximo global entregado descartaría la foto
+de A solo porque la de B (posterior en el contador, pero de OTRO jugador) haya
+salido antes. Cada jugador solo se compara consigo mismo.
 """
 import threading
 from contextlib import contextmanager, nullcontext
@@ -66,20 +72,27 @@ SIN_CANAL = nullcontext()
 
 class RoomChannel:
     """Canal de salida de una sala: serializa sus emisiones y recuerda hasta
-    qué versión se ha emitido.
+    qué versión se ha emitido, POR DESTINATARIO.
 
     `lock` es por sala, nunca global: dos mesas pueden estar emitiendo a la
-    vez sin pisarse, que es justo el punto. `version` se incrementa bajo el
-    cerrojo de la sala (es la marca de "estado más reciente que se ha
-    construido") y se compara con `last_emitted` bajo `lock`, al emitir, para
-    descartar lo obsoleto."""
+    vez sin pisarse, que es justo el punto. `version` es un contador único del
+    canal que se incrementa bajo el cerrojo de la sala (es la marca de "estado
+    más reciente que se ha construido") y `last_emitted` guarda, por sid, la
+    última versión que YA SALIÓ para ese jugador. Al emitir se descarta lo
+    obsoleto por sid: una foto de A solo es vieja si A ya vio otra posterior,
+    nunca porque B haya visto la suya."""
 
     __slots__ = ('lock', 'version', 'last_emitted', 'closed')
 
     def __init__(self):
         self.lock = threading.Lock()
         self.version = 0
-        self.last_emitted = 0
+        # sid -> última versión entregada a ese jugador. Por sid y no un máximo
+        # global: el contador `version` es único del canal (cada snapshot para
+        # cualquier jugador consume un número), así que un máximo global
+        # descartaría la foto pendiente de A solo porque la de B, posterior en
+        # el contador pero de otro jugador, haya salido antes.
+        self.last_emitted = {}
         # La sala se borró mientras alguien tenía un snapshot en la mano.
         self.closed = False
 
@@ -123,6 +136,24 @@ class EmitBatch:
                 for sid, (version, payload) in per_sid.items():
                     if version >= entry[1].get(sid, (0, None))[0]:
                         entry[1][sid] = (version, payload)
+                # Poda de quien se fue en mitad de la transacción: cada difusión
+                # de sala es una foto COMPLETA para todos sus conectados, así que
+                # si la difusión más nueva ya no trae a un sid que la anterior sí
+                # traía, ese sid soltó su asiento entre una y otra (desconexión)
+                # y su foto vieja no vale: lo muestra como miembro de una mesa de
+                # la que ya no forma parte. Sin esta poda, el descarte por sid
+                # del `flush` la emitiría igual (para ÉL es la más nueva que se
+                # construyó), y un sid que migró de mesa recibiría un
+                # `game_update` fantasma de su mesa anterior.
+                #
+                # Solo poda lo estrictamente más viejo que la difusión entrante
+                # (comparado contra su versión máxima): si por lo que sea la
+                # entrante no es posterior, no se tira nada.
+                mas_nueva = max((version for version, _payload in per_sid.values()),
+                                default=0)
+                for sid in [s for s, (version, _p) in entry[1].items()
+                            if s not in per_sid and version < mas_nueva]:
+                    del entry[1][sid]
         self.directs.extend(other.directs)
         self.replies.extend(other.replies)
 
@@ -250,16 +281,19 @@ class Outbox:
             with channel.lock:
                 if channel.closed:
                     continue
-                emitida = channel.last_emitted
                 for sid, (version, payload) in per_sid.items():
-                    if version <= emitida:
-                        # Obsoleta: otro hilo ya entregó un estado más nuevo de
-                        # esta sala. Emitirla sería hacer retroceder la vista
-                        # del cliente.
+                    # Descarte POR DESTINATARIO: la foto solo es obsoleta si
+                    # ESTE jugador ya vio otra posterior. Comparar contra un
+                    # máximo global del canal perdería actualizaciones: la foto
+                    # pendiente de A (versión N) se descartaría porque la de B
+                    # (versión N+1, de otro jugador) salió antes, y A se
+                    # quedaría sin nada.
+                    if version <= channel.last_emitted.get(sid, 0):
+                        # Obsoleta: este jugador ya recibió un estado más nuevo
+                        # de esta sala. Emitirla sería hacer retroceder su vista.
                         continue
                     emit('game_update', payload, to=sid)
-                    emitida = version
-                channel.last_emitted = emitida
+                    channel.last_emitted[sid] = version
         for channel, event, payload, to in batch.directs:
             with channel.lock if channel is not None else SIN_CANAL:
                 if channel is not None and channel.closed:

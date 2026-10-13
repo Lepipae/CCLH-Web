@@ -83,19 +83,23 @@ class _UuidContador:
         return f"{self.n:08x}-fuzz"
 
 
-def _auto_next_round_sin_dormir(manager, room_id, czar_sid):
+def _auto_next_round_sin_dormir(manager, room_id, czar_sid, round_gen=None):
     """El `auto_next_round` real, sin los 5 s de espera.
 
     Es la tarea en segundo plano que lanza `choose_winner`. En vez de dispararse
     sola tras 5 s (imposible de sincronizar), el fuzz la encola y la ejecuta
     cuando le parece. replica el cerrojo POR SALA del original: la sala se
     resuelve, se bloquea, y la sala ya bloqueada se le pasa a
-    `advance_to_next_round` para que no vuelva a buscarla en el registro."""
+    `advance_to_next_round` para que no vuelva a buscarla en el registro. Y
+    replica también su token de generación: si la ronda ya avanzó (a mano o por
+    otra tarea), la generación se movió y esta tarea es de una ronda vieja."""
     room = manager.rooms.get(room_id)
     if room is None:
         return
     with manager._sala(room):
         if room.state == "round_end" and room.czar == czar_sid:
+            if round_gen is not None and room.round_gen != round_gen:
+                return
             manager.advance_to_next_round(room_id, room)
 
 

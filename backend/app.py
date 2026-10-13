@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 from flask import Flask, jsonify, request, send_from_directory
 from flask_socketio import SocketIO, join_room, leave_room, emit
 from models.game_manager import GameManager
+
+logger = logging.getLogger(__name__)
 
 # Configurar Flask para servir archivos estáticos del frontend de React
 app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
@@ -37,7 +40,7 @@ def cargar_cartas():
             break
 
     if not archivo:
-        print("Error: No se encontró ningún archivo de cartas.")
+        logger.error("No se encontró ningún archivo de cartas base.")
         return
 
     try:
@@ -45,9 +48,10 @@ def cargar_cartas():
             datos = json.load(f)
             CARTAS_BLANCAS = list(datos.get('whiteCards', []))
             CARTAS_NEGRAS = list(datos.get('blackCards', []))
-            print(f"Cartas base cargadas ({archivo}): {len(CARTAS_BLANCAS)} blancas, {len(CARTAS_NEGRAS)} negras.")
-    except Exception as e:
-        print("Error cargando cartas base:", e)
+            logger.info("Cartas base cargadas (%s): %d blancas, %d negras.",
+                        archivo, len(CARTAS_BLANCAS), len(CARTAS_NEGRAS))
+    except Exception:
+        logger.exception("Error cargando cartas base")
 
     # Cargar y sincronizar cartasCustom.json con la carpeta externa
     # (la ruta interna es sobrescribible por entorno para los tests)
@@ -83,16 +87,16 @@ def cargar_cartas():
         try:
             with open(ext_main_file, 'r', encoding='utf-8') as f:
                 merge_cards(json.load(f))
-        except Exception as e:
-            print("Error leyendo ext_main_file:", e)
+        except Exception:
+            logger.exception("Error leyendo carta custom externa %s", ext_main_file)
 
     # 2. Intentar cargar desde DataScraping/cartasCustom.json interno
     if os.path.exists(internal_custom_path):
         try:
             with open(internal_custom_path, 'r', encoding='utf-8') as f:
                 merge_cards(json.load(f))
-        except Exception as e:
-            print("Error leyendo internal_custom_path:", e)
+        except Exception:
+            logger.exception("Error leyendo carta custom interna %s", internal_custom_path)
 
     # 3. Cargar cualquier otro archivo .json en ext_dir
     if os.path.exists(ext_dir):
@@ -102,8 +106,8 @@ def cargar_cartas():
                 try:
                     with open(fpath, 'r', encoding='utf-8') as f:
                         merge_cards(json.load(f))
-                except Exception as e:
-                    print(f"Error importando archivo externo {fname}:", e)
+                except Exception:
+                    logger.exception("Error importando archivo externo %s", fname)
 
     # Si hay cartas custom, sincronizar y guardar de forma segura en ambos sitios
     if custom_data['whiteCards'] or custom_data['blackCards']:
@@ -112,10 +116,11 @@ def cargar_cartas():
                 json.dump(custom_data, f, ensure_ascii=False, indent=2)
             with open(ext_main_file, 'w', encoding='utf-8') as f:
                 json.dump(custom_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print("Error guardando sincronización de cartas custom:", e)
+        except Exception:
+            logger.exception("Error guardando sincronización de cartas custom")
 
-    print(f"Cartas personalizadas sincronizadas ({ext_dir}): {len(custom_data.get('whiteCards', []))} blancas, {len(custom_data.get('blackCards', []))} negras.")
+    logger.info("Cartas personalizadas sincronizadas (%s): %d blancas, %d negras.",
+                ext_dir, len(custom_data.get('whiteCards', [])), len(custom_data.get('blackCards', [])))
 
     c_whites = custom_data.get('whiteCards', [])
     c_blacks = custom_data.get('blackCards', [])
@@ -238,7 +243,14 @@ def on_add_custom_card(data):
     data = _datos(data)
     def respond_cb(res):
         emit('custom_card_result', res)
-    manager.add_custom_card(data.get('type'), data.get('text', ''), data.get('pick', 1), respond_cb)
+    # Todo lo del socket es no confiable: tipo y texto se recortan con el
+    # escudo común y el pick se normaliza sin blanquearlo (un `null` o una
+    # lista no son un 1: el manager los rechaza con su propio mensaje).
+    card_type = _texto(data.get('type'))
+    text = _texto(data.get('text'))
+    pick_raw = data.get('pick', 1)
+    pick = _texto(pick_raw, None) if isinstance(pick_raw, str) else pick_raw
+    manager.add_custom_card(card_type, text, pick, respond_cb)
 
 @socketio.on('get_custom_cards')
 def on_get_custom_cards():
@@ -251,7 +263,7 @@ def on_delete_custom_card(data):
     data = _datos(data)
     def respond_cb(res):
         emit('custom_card_deleted', res)
-    manager.delete_custom_card(data.get('type'), data.get('text', ''), respond_cb)
+    manager.delete_custom_card(_texto(data.get('type')), _texto(data.get('text')), respond_cb)
 
 @socketio.on('import_custom_cards')
 def on_import_custom_cards(data):
@@ -263,12 +275,12 @@ def on_import_custom_cards(data):
 @socketio.on('add_room_cards')
 def on_add_room_cards(data):
     data = _datos(data)
-    manager.add_room_cards(_texto(data.get('room_id')).upper(), data.get('cards', ''))
+    manager.add_room_cards(_texto(data.get('room_id')).upper(), _texto(data.get('cards')))
 
 @socketio.on('send_chat')
 def on_send_chat(data):
     data = _datos(data)
-    manager.send_chat(request.sid, _texto(data.get('room_id')).upper(), data.get('msg', ''))
+    manager.send_chat(request.sid, _texto(data.get('room_id')).upper(), _texto(data.get('msg')))
 
 if __name__ == '__main__':
     # Servidor embebido (Werkzeug) solo para desarrollo local.

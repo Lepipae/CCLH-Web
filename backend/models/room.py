@@ -40,6 +40,15 @@ class Room:
         self.last_winning_card = None
         self.last_winner_name = None
 
+        # Generación de la ronda: token monótono que invalida las tareas de
+        # auto-avance viejas. Cada ronda nueva (`start_game`,
+        # `advance_to_next_round`) lo incrementa y `choose_winner` programa su
+        # `auto_next_round` con el valor vigente; al despertar, la tarea solo
+        # avanza si la generación no se ha movido. Sin esto, una tarea dormida
+        # de una ronda anterior podía avanzar una ronda posterior que casualmente
+        # tuviera el mismo estado y el mismo juez.
+        self.round_gen = 0
+
         # Momento (time.time()) en el que la sala se quedó sin jugadores conectados.
         # None mientras haya alguien conectado. Es el reloj de silencio de la
         # máquina de presencia de la sala: el reaper lo mide igual que el last_seen

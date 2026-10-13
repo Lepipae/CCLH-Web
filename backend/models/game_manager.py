@@ -204,6 +204,11 @@ class GameManager(CustomCardsMixin):
         `room` se pasa cuando el llamante ya lo tiene resuelto (así se evita
         buscarlo dos veces); si no, se busca aquí. Si la sala no existe se
         entrega None y el cuerpo decide qué hacer: casi siempre, no hacer nada.
+
+        El drenaje va en `finally` a propósito: si el cuerpo lanza, el estado
+        ya ha podido mutar (y sus snapshots ya están encolados) y toca
+        entregarlos igual antes de propagar el error. Perder el lote en una
+        excepción sería perder actualizaciones ya serializadas.
         """
         if room is None:
             with self._registro():
@@ -211,10 +216,18 @@ class GameManager(CustomCardsMixin):
         if room is None:
             yield None
             return
-        with self._sala(room):
-            with self._outbox.lote() as lote:
-                yield room
-        self._outbox.drenar(lote)
+        lote = None
+        try:
+            with self._sala(room):
+                with self._outbox.lote() as b:
+                    lote = b
+                    yield room
+        finally:
+            # FUERA de los cerrojos de juego, haya ido bien o no el cuerpo. Si
+            # la transacción era anidada, `drenar` no emite (el lote ya se
+            # fundió con el de fuera) y es el nivel más externo el que sale.
+            if lote is not None:
+                self._outbox.drenar(lote)
 
     @contextmanager
     def _tx_registro(self):
@@ -222,11 +235,19 @@ class GameManager(CustomCardsMixin):
         cartas). La usan las operaciones que no son de ninguna mesa: dar de alta
         una carta propia, importar un set entero, avisar de que el servidor está
         lleno. Lo que hacen con las salas vivas es tomarlas de una en una desde
-        aquí, con el orden bueno (registro -> sala)."""
-        with self._registro():
-            with self._outbox.lote() as lote:
-                yield lote
-        self._outbox.drenar(lote)
+        aquí, con el orden bueno (registro -> sala).
+
+        Como en `_tx_sala`, el drenaje va en `finally`: un error en el cuerpo
+        no puede dejar el lote sin emitir."""
+        lote = None
+        try:
+            with self._registro():
+                with self._outbox.lote() as b:
+                    lote = b
+                    yield lote
+        finally:
+            if lote is not None:
+                self._outbox.drenar(lote)
 
     @contextmanager
     def _tx_salas(self, *salas):
@@ -240,14 +261,22 @@ class GameManager(CustomCardsMixin):
         todos los hilos y el deadlock es imposible por construcción. El cerrojo
         de registro NO se puede tomar aquí (lo verifica `_registro`), así que
         quien llame tiene que tener resuelto qué salas son antes, con el registro.
+
+        El drenaje va en `finally`, como en `_tx_sala`: si el cuerpo lanza, lo
+        encolado hasta entonces sale igual antes de propagar el error.
         """
         valves = ExitStack()
-        with valves:
-            for sala in sorted(salas, key=lambda r: r.room_id):
-                valves.enter_context(self._sala(sala))
-            with self._outbox.lote() as lote:
-                yield salas
-        self._outbox.drenar(lote)
+        lote = None
+        try:
+            with valves:
+                for sala in sorted(salas, key=lambda r: r.room_id):
+                    valves.enter_context(self._sala(sala))
+                with self._outbox.lote() as b:
+                    lote = b
+                    yield salas
+        finally:
+            if lote is not None:
+                self._outbox.drenar(lote)
 
     def _salas_de(self, sid):
         """Salas en las que `sid` tiene algún asiento (conectado o no). Solo el
@@ -714,8 +743,10 @@ class GameManager(CustomCardsMixin):
 
     def _revert_to_waiting(self, room):
         """Devuelve la sala a la pantalla de espera: con menos de dos jugadores
-        reales no puede haber partida en curso."""
+        reales no puede haber partida en curso. La generación de ronda también
+        avanza: invalida el auto-avance pendiente del recuento que se aborta."""
         room.state = 'waiting'
+        room.round_gen += 1
         self._discard_round_cards(room)
         room.renew_votes.clear()
         room.czar = None
@@ -1178,6 +1209,26 @@ class GameManager(CustomCardsMixin):
             if room is not None:
                 self._start_game_locked(sid, room_id, room)
 
+    def _draw_black_card(self, room):
+        """Roba una carta negra del mazo de la sala. Nunca lanza IndexError.
+
+        Si la sala agotó las suyas, se rebaraja con el mazo global (las ya
+        usadas vuelven: estaban fuera de `available_blacks` pero siguen en el
+        global, así que rellenar desde él es reusar las descartadas). Si no hay
+        ninguna en el sistema (global vacío), devuelve None: es el error
+        controlado y quien llama decide (conservar la actual o no arrancar),
+        pero nunca se revienta con un `random.choice([])`."""
+        if not room.available_blacks:
+            room.available_blacks = list(self.global_black_cards)
+        if not room.available_blacks:
+            logger.warning(
+                "Sala '%s': sin cartas negras disponibles (global vacío); "
+                "se conserva la actual", room.room_id)
+            return None
+        drawn = random.choice(room.available_blacks)
+        room.available_blacks.remove(drawn)
+        return drawn
+
     def _start_game_locked(self, sid, room_id, room=None):
         if room is not None:
             if room.state == 'waiting' and room.leader == sid and room.asiento(sid) is not None:
@@ -1190,8 +1241,16 @@ class GameManager(CustomCardsMixin):
                     # la carta negra ni el estado de la sala
                     return
 
+                # La negra se roba ANTES de mutar nada: si no hay ninguna en el
+                # sistema (`_draw_black_card` devuelve None) se aborta el arranque
+                # sin haber quemado cartas blancas ni haber tocado el estado.
+                drawn_black = self._draw_black_card(room)
+                if drawn_black is None:
+                    return
+
                 room.state = 'playing'
                 room.ha_empezado = True
+                room.round_gen += 1
                 room.renew_votes.clear()
 
                 hand_size = room.options['hand_size']
@@ -1207,13 +1266,8 @@ class GameManager(CustomCardsMixin):
                     room.czar = self._pick_connected_czar(room, None) or active[0].sid
                 else:
                     room.czar = random.choice(active).sid
-                    
-                if not room.available_blacks:
-                    room.available_blacks = list(self.global_black_cards)
-                
-                drawn = random.choice(room.available_blacks)
-                room.available_blacks.remove(drawn)
-                room.black_card = drawn
+
+                room.black_card = drawn_black
                 self.send_room_update(room_id, _room=room)
 
     def update_options(self, sid, room_id, data):
@@ -1269,11 +1323,26 @@ class GameManager(CustomCardsMixin):
                 #    sistema para siempre. Es conservación de cartas, que es
                 #    justo lo que este código no puede dejar en manos del
                 #    cliente.
+                # 3. `bool` es subclase de `int` en Python (`True == 1`), así
+                #    que `isinstance(True, int)` es cierto y `True` jugaría la
+                #    carta 1. Se exige `type(i) is int`, que deja fuera a los
+                #    booleanos que el JSON sí puede traer.
+                # 4. La jugada tiene que traer EXACTAMENTE las cartas que pide
+                #    la negra (`pick`): con menos se juega una ronda coja y con
+                #    más se queman cartas de la mano que ya no vuelven. Si no
+                #    cuadra, la jugada entera se descarta sin tocar nada.
                 indices = card_index if isinstance(card_index, list) else [card_index]
                 valid_indices = []
                 for i in indices:
-                    if isinstance(i, int) and 0 <= i < len(p.hand) and i not in valid_indices:
+                    if type(i) is int and 0 <= i < len(p.hand) and i not in valid_indices:
                         valid_indices.append(i)
+                pick = room.black_card.get('pick', 1) if isinstance(room.black_card, dict) else 1
+                try:
+                    pick = int(pick)
+                except (TypeError, ValueError):
+                    pick = 1
+                if len(valid_indices) != pick:
+                    return
                 if valid_indices:
                     # Preservar el orden original en el que el jugador seleccionó las cartas
                     played_texts = [p.hand[i] for i in valid_indices]
@@ -1335,19 +1404,34 @@ class GameManager(CustomCardsMixin):
                     room.last_winning_card = [c for c in room.played_cards if c.get('id') == sub_id][0]['cards']
                     room.last_winner_name = ganador.name
                     self.send_room_update(room_id, _room=room)
-                    
-                    self.socketio.start_background_task(self.auto_next_round, room_id, sid)
 
-    def auto_next_round(self, room_id, old_czar_sid):
+                    # El auto-avance lleva el token de generación de la ronda que
+                    # cierra. Sin él, una tarea vieja (5 s de sueño) podía
+                    # avanzar una ronda POSTERIOR: si el juez pasó de ronda a
+                    # mano y el mismo czar volvió a cerrar otro recuento, el
+                    # `state == 'round_end' and czar == old_czar` seguía siendo
+                    # cierto y la tarea estancada avanzaba una ronda que no era
+                    # la suya. Con el token, solo avanza si la generación no se
+                    # ha movido desde que se programó.
+                    self.socketio.start_background_task(
+                        self.auto_next_round, room_id, sid, room.round_gen)
+
+    def auto_next_round(self, room_id, old_czar_sid, round_gen=None):
         # La espera va FUERA de la transacción a propósito: dentro del cerrojo
         # serían 5 s de sala parada (y con el registro global encima, 5 s de
         # servidor parado) por un simple auto-avance de ronda.
         self.socketio.sleep(5)
         # La comprobación va DENTRO del cerrojo de esa sala: entre el sleep y
         # aquí el juez puede haber cambiado o la ronda haberse-advanzado, y un
-        # auto-avance a destiempo rehece una ronda que ya no existe.
+        # auto-avance a destiempo rehece una ronda que ya no existe. El token de
+        # generación (`round_gen`) es la tercera condición: aunque el estado y
+        # el juez coincidan, si la ronda ya avanzó (a mano o por otra tarea) la
+        # generación se movió y esta tarea es de una ronda vieja. `None` es
+        # "sin token" (llamadas antiguas/tests): se acepta por compatibilidad.
         with self._tx_sala(room_id) as room:
             if room is not None and room.state == 'round_end' and room.czar == old_czar_sid:
+                if round_gen is not None and room.round_gen != round_gen:
+                    return
                 self.advance_to_next_round(room_id, room)
 
     def force_next_round(self, sid, room_id):
@@ -1395,6 +1479,7 @@ class GameManager(CustomCardsMixin):
                     self._rotate_czar_from(room, room.czar)
                 
             room.state = 'playing'
+            room.round_gen += 1
             # Las cartas de la ronda que acaba de terminar vuelven al mazo. Antes
             # se haces `played_cards = []` a secas y esas cartas desaparecian del
             # sistema para siempre: dos cartas perdidas en CADA ronda, sin que
@@ -1403,13 +1488,13 @@ class GameManager(CustomCardsMixin):
             # señalando desde hacia tiempo sin que nadie lo mirara.
             self._discard_round_cards(room)
             room.renew_votes.clear()
-            
-            if not room.available_blacks:
-                room.available_blacks = list(self.global_black_cards)
-            
-            drawn = random.choice(room.available_blacks)
-            room.available_blacks.remove(drawn)
-            room.black_card = drawn
+
+            # Si no queda ninguna negra en el sistema se conserva la actual y la
+            # ronda sigue con ella: es preferible repetir carta a reventar con
+            # un IndexError en mitad del avance.
+            drawn = self._draw_black_card(room)
+            if drawn is not None:
+                room.black_card = drawn
             
             hand_size = room.options['hand_size']
             for p in room.players.values():
@@ -1476,10 +1561,16 @@ class GameManager(CustomCardsMixin):
     def check_and_execute_renew(self, room):
         # Anidada: la llaman vote_renew y _release_from_room, que ya tienen el
         # cerrojo de esta misma sala. Reentrante, y su lote se funde con el de
-        # fuera en vez de provocar un drenaje propio en medio.
-        with self._sala(room), self._outbox.lote() as lote:
-            self._check_and_execute_renew(room)
-        self._outbox.drenar(lote)
+        # fuera en vez de provocar un drenaje propio en medio. El drenaje va en
+        # `finally` como en `_tx_sala`: si el cuerpo lanza, lo encolado sale igual.
+        lote = None
+        try:
+            with self._sala(room), self._outbox.lote() as b:
+                lote = b
+                self._check_and_execute_renew(room)
+        finally:
+            if lote is not None:
+                self._outbox.drenar(lote)
 
     def _check_and_execute_renew(self, room):
         active = room.get_active_players()
@@ -1525,13 +1616,17 @@ class GameManager(CustomCardsMixin):
             if (room.state == 'playing' and room.czar == sid
                     and room.asiento(sid) is not None):
                 old_black = room.black_card
-                if not room.available_blacks:
-                    room.available_blacks = list(self.global_black_cards)
-                    
-                drawn = random.choice(room.available_blacks)
-                room.available_blacks.remove(drawn)
+                drawn = self._draw_black_card(room)
+                if drawn is None:
+                    # Sin negras en el sistema: no hay nada que cambiar y se
+                    # conserva la actual en vez de reventar con un IndexError.
+                    return
                 room.black_card = drawn
-                room.available_blacks.append(old_black)
+                # La anterior vuelve al mazo para poder reusarse (es la que
+                # permite que el robo de arriba no se agote); si era None (ronda
+                # sin negra, que no debería pasar en 'playing') no se mete nada.
+                if old_black is not None:
+                    room.available_blacks.append(old_black)
                 
                 for p in room.players.values():
                     if p.played_card is not None:
